@@ -1,4 +1,7 @@
 #include "App.h"
+#include "Mesh.h"
+#include "Material.h"
+#include "Texture.h"
 #include <stdexcept>
 #include <fstream>
 #include <cmath>
@@ -7,6 +10,17 @@
 #include <imgui_impl_dx12.h>
 
 using namespace DirectX;
+
+// Resolve a relative path against the directory containing the executable.
+static std::string ResolveExePath(const std::string& relativePath) {
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string dir(exePath);
+    auto pos = dir.find_last_of("\\/");
+    if (pos != std::string::npos)
+        dir = dir.substr(0, pos + 1);
+    return dir + relativePath;
+}
 
 static const UINT SceneConstantCount = sizeof(App::SceneConstants) / sizeof(UINT32);
 static_assert(sizeof(App::SceneConstants) % 4 == 0, "SceneConstants must be 4-byte aligned");
@@ -27,6 +41,11 @@ void App::Init(HWND hwnd) {
     InitFence();
     InitViewport();
     CreatePipelineState();
+
+    m_resourceManager.Init(m_device.Get(), m_commandQueue.Get());
+    // Transient heap: 1024 descriptors, slot 0 reserved for ImGui
+    m_transientHeap.Init(m_device.Get(), 1024, 1);
+
     LoadScene();
     InitImGui(hwnd);
 
@@ -137,13 +156,15 @@ void App::InitDepthBuffer() {
 }
 
 void App::InitCommandList() {
-    ThrowIfFailed(m_device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        IID_PPV_ARGS(&m_commandAllocator)));
+    for (UINT i = 0; i < FrameCount; i++) {
+        ThrowIfFailed(m_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&m_commandAllocators[i])));
+    }
 
     ThrowIfFailed(m_device->CreateCommandList(0,
         D3D12_COMMAND_LIST_TYPE_DIRECT,
-        m_commandAllocator.Get(), nullptr,
+        m_commandAllocators[0].Get(), nullptr,
         IID_PPV_ARGS(&m_commandList)));
     ThrowIfFailed(m_commandList->Close());
 }
@@ -216,8 +237,8 @@ void App::CreatePipelineState() {
         signature->GetBufferPointer(), signature->GetBufferSize(),
         IID_PPV_ARGS(&m_rootSignature)));
 
-    auto vsBlob = LoadShaderBlob("shaders/pbr_vs.cso");
-    auto psBlob = LoadShaderBlob("shaders/pbr_ps.cso");
+    auto vsBlob = LoadShaderBlob(ResolveExePath("shaders/pbr_vs.cso"));
+    auto psBlob = LoadShaderBlob(ResolveExePath("shaders/pbr_ps.cso"));
 
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
@@ -264,51 +285,10 @@ void App::CreatePipelineState() {
 }
 
 void App::LoadScene() {
-    m_scene.LoadFromGltf("models/scene.gltf");
-
-    // Create SRV heap: slot 0 for ImGui, then 2 slots per material
-    // (base color SRV + emissive SRV as contiguous pair for descriptor table)
-    UINT numMaterials = static_cast<UINT>(m_scene.GetMaterials().size());
-    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-    srvHeapDesc.NumDescriptors = 1 + numMaterials * 2;
-    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    ThrowIfFailed(m_device->CreateDescriptorHeap(&srvHeapDesc,
-        IID_PPV_ARGS(&m_srvHeap)));
-    m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-
-    // Upload textures via command list
-    ThrowIfFailed(m_commandAllocator->Reset());
-    ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr));
-    m_scene.CreateGpuResources(m_device.Get(), m_commandList.Get());
-    ThrowIfFailed(m_commandList->Close());
-
-    ID3D12CommandList* lists[] = { m_commandList.Get() };
-    m_commandQueue->ExecuteCommandLists(1, lists);
-    WaitForGpu();
-
-    // Build per-material SRV pairs starting at slot 1
-    const auto& materials = m_scene.GetMaterials();
-    for (UINT m = 0; m < numMaterials; m++) {
-        D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-        handle.ptr += (1 + m * 2) * m_srvDescriptorSize;
-
-        // Slot 0 of pair: base color texture
-        int baseIdx = materials[m].baseColorTextureIndex;
-        if (baseIdx >= 0)
-            m_scene.CreateTextureSRV(m_device.Get(), handle, baseIdx);
-
-        // Slot 1 of pair: emissive texture
-        handle.ptr += m_srvDescriptorSize;
-        int emIdx = materials[m].emissiveTextureIndex;
-        if (emIdx >= 0)
-            m_scene.CreateTextureSRV(m_device.Get(), handle, emIdx);
-    }
+    m_mesh = m_resourceManager.Load<Mesh>(ResolveExePath("models/scene.gltf"));
 }
 
 void App::InitImGui(HWND hwnd) {
-    // SRV heap already created in LoadScene (slot 0 reserved for ImGui)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -320,32 +300,63 @@ void App::InitImGui(HWND hwnd) {
     initInfo.CommandQueue = m_commandQueue.Get();
     initInfo.NumFramesInFlight = FrameCount;
     initInfo.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-    initInfo.SrvDescriptorHeap = m_srvHeap.Get();
-    initInfo.LegacySingleSrvCpuDescriptor = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-    initInfo.LegacySingleSrvGpuDescriptor = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    // ImGui uses slot 0 in the transient (shader-visible) heap
+    initInfo.SrvDescriptorHeap = m_transientHeap.GetHeap();
+    initInfo.LegacySingleSrvCpuDescriptor = m_transientHeap.GetCPUHandle(0);
+    initInfo.LegacySingleSrvGpuDescriptor = m_transientHeap.GetGPUHandle(0);
     ImGui_ImplDX12_Init(&initInfo);
 }
 
 void App::Update(float dt) {
     m_camera.Update(dt);
+
+    // FPS counter — update once per second
+    m_fpsFrameCount++;
+    m_fpsAccumulator += dt;
+    if (m_fpsAccumulator >= 1.0f) {
+        m_fps = static_cast<float>(m_fpsFrameCount) / m_fpsAccumulator;
+        m_fpsFrameCount = 0;
+        m_fpsAccumulator = 0.0f;
+    }
 }
 
 void App::WaitForGpu() {
-    m_fenceValue++;
-    ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), m_fenceValue));
-    if (m_fence->GetCompletedValue() < m_fenceValue) {
-        ThrowIfFailed(m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent));
+    // Full GPU drain — used only for init/shutdown, not per-frame
+    UINT64 fenceValue = m_nextFenceValue++;
+    ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), fenceValue));
+    if (m_fence->GetCompletedValue() < fenceValue) {
+        ThrowIfFailed(m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent));
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+    // All frames are now complete
+    for (UINT i = 0; i < FrameCount; i++)
+        m_frameFenceValues[i] = fenceValue;
+}
+
+void App::WaitForFrame(UINT frameIndex) {
+    // Wait only if the GPU hasn't finished this frame's previous work
+    if (m_fence->GetCompletedValue() < m_frameFenceValues[frameIndex]) {
+        ThrowIfFailed(m_fence->SetEventOnCompletion(m_frameFenceValues[frameIndex], m_fenceEvent));
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
 }
 
 void App::Render() {
-    ThrowIfFailed(m_commandAllocator->Reset());
-    ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(),
+    // Process deferred deletions from previous frames
+    m_resourceManager.ProcessDeferredDeletions(m_fence->GetCompletedValue());
+
+    // Wait for this frame's previous submission to complete before reusing its allocator
+    WaitForFrame(m_frameIndex);
+
+    ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
+    ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(),
         m_pipelineState.Get()));
 
-    // Set shared descriptor heap for both scene textures and ImGui
-    ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
+    // Reset transient heap for this frame (preserves reserved slot 0 for ImGui)
+    m_transientHeap.Reset();
+
+    // Bind the transient (shader-visible) heap
+    ID3D12DescriptorHeap* heaps[] = { m_transientHeap.GetHeap() };
     m_commandList->SetDescriptorHeaps(1, heaps);
 
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
@@ -382,33 +393,56 @@ void App::Render() {
     XMFLOAT3 lightDir = { 0.0f, sinf(angle), cosf(angle) };
 
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    auto vbv = m_scene.GetVertexBufferView();
-    auto ibv = m_scene.GetIndexBufferView();
+    auto vbv = m_mesh->GetVertexBufferView();
+    auto ibv = m_mesh->GetIndexBufferView();
     m_commandList->IASetVertexBuffers(0, 1, &vbv);
     m_commandList->IASetIndexBuffer(&ibv);
 
-    const auto& materials = m_scene.GetMaterials();
-    for (const auto& sub : m_scene.GetSubMeshes()) {
+    // Null SRV for materials without textures — allocate once in persistent heap
+    // and reuse. We create it here but it persists across frames since the
+    // persistent heap slot is stable.
+    static D3D12_CPU_DESCRIPTOR_HANDLE nullSrvHandle = {};
+    static bool nullSrvCreated = false;
+    static UINT nullSrvIndex = UINT_MAX;
+    if (!nullSrvCreated) {
+        nullSrvHandle = m_resourceManager.GetSRVHeap().Allocate(nullSrvIndex);
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+        nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullDesc.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(nullptr, &nullDesc, nullSrvHandle);
+        nullSrvCreated = true;
+    }
+
+    const auto& materials = m_mesh->GetMaterials();
+    for (const auto& sub : m_mesh->GetSubMeshes()) {
         const auto& mat = materials[sub.materialIndex];
 
         SceneConstants constants = {};
         XMStoreFloat4x4(&constants.viewProj, XMMatrixTranspose(view * proj));
         constants.cameraPos = camPos;
-        constants.roughness = mat.roughness;
+        constants.roughness = mat->roughness;
         constants.lightDir = lightDir;
-        constants.metallic = mat.metallic;
-        constants.baseColorFactor = mat.baseColorFactor;
-        constants.hasTexture = (mat.baseColorTextureIndex >= 0) ? 1 : 0;
-        constants.emissiveFactor = mat.emissiveFactor;
-        constants.hasEmissiveTexture = (mat.emissiveTextureIndex >= 0) ? 1 : 0;
+        constants.metallic = mat->metallic;
+        constants.baseColorFactor = mat->baseColorFactor;
+        constants.hasTexture = mat->HasBaseColorTexture() ? 1 : 0;
+        constants.emissiveFactor = mat->emissiveFactor;
+        constants.hasEmissiveTexture = mat->HasEmissiveTexture() ? 1 : 0;
 
         m_commandList->SetGraphicsRoot32BitConstants(0, SceneConstantCount,
             &constants, 0);
 
-        // Bind per-material SRV pair (slot 1 + matIndex*2 in the heap)
+        // Copy material's texture descriptors from persistent → transient heap
+        D3D12_CPU_DESCRIPTOR_HANDLE srcHandles[2];
+
+        srcHandles[0] = mat->baseColorTexture
+            ? mat->baseColorTexture->GetSRVHandle() : nullSrvHandle;
+        srcHandles[1] = mat->emissiveTexture
+            ? mat->emissiveTexture->GetSRVHandle() : nullSrvHandle;
+
         D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle =
-            m_srvHeap->GetGPUDescriptorHandleForHeapStart();
-        gpuHandle.ptr += (1 + sub.materialIndex * 2) * m_srvDescriptorSize;
+            m_transientHeap.CopyDescriptors(m_device.Get(), srcHandles, 2);
         m_commandList->SetGraphicsRootDescriptorTable(1, gpuHandle);
 
         m_commandList->DrawIndexedInstanced(sub.indexCount, 1,
@@ -421,27 +455,33 @@ void App::Render() {
     ImGui::NewFrame();
 
     ImGui::Begin("Scene Inspector");
+    ImGui::Text("%.1f FPS (%.2f ms)", m_fps, m_fps > 0.0f ? 1000.0f / m_fps : 0.0f);
     XMFLOAT3 pos = m_camera.GetPosition();
     ImGui::Text("Camera: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
+    ImGui::SliderFloat("Move Speed", &m_camera.GetMoveSpeed(), 1.0f, 50.0f);
+    ImGui::Checkbox("VSync", &m_vsync);
     ImGui::Separator();
 
-    const auto& subMeshes = m_scene.GetSubMeshes();
-    auto& editMaterials = m_scene.GetMaterials();
+    const auto& subMeshes = m_mesh->GetSubMeshes();
+    auto& editMaterials = m_mesh->GetMaterials();
 
     if (ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (size_t i = 0; i < editMaterials.size(); i++) {
             auto& mat = editMaterials[i];
-            char label[64];
-            snprintf(label, sizeof(label), "Material %d", (int)i);
+            char label[128];
+            if (!mat->name.empty())
+                snprintf(label, sizeof(label), "[%d] %s", (int)i, mat->name.c_str());
+            else
+                snprintf(label, sizeof(label), "Material %d", (int)i);
             if (ImGui::TreeNode(label)) {
-                ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
-                ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
-                ImGui::ColorEdit4("Base Color", &mat.baseColorFactor.x);
-                ImGui::ColorEdit3("Emissive", &mat.emissiveFactor.x);
-                ImGui::Text("Base Texture: %d", mat.baseColorTextureIndex);
-                ImGui::Text("Emissive Texture: %d", mat.emissiveTextureIndex);
-                ImGui::Checkbox("Double Sided", &mat.doubleSided);
-                ImGui::Checkbox("Alpha Blend", &mat.alphaBlend);
+                ImGui::SliderFloat("Roughness", &mat->roughness, 0.0f, 1.0f);
+                ImGui::SliderFloat("Metallic", &mat->metallic, 0.0f, 1.0f);
+                ImGui::ColorEdit4("Base Color", &mat->baseColorFactor.x);
+                ImGui::ColorEdit3("Emissive", &mat->emissiveFactor.x);
+                ImGui::Text("Base Texture: %s", mat->HasBaseColorTexture() ? "Yes" : "None");
+                ImGui::Text("Emissive Texture: %s", mat->HasEmissiveTexture() ? "Yes" : "None");
+                ImGui::Checkbox("Double Sided", &mat->doubleSided);
+                ImGui::Checkbox("Alpha Blend", &mat->alphaBlend);
                 ImGui::TreePop();
             }
         }
@@ -450,8 +490,11 @@ void App::Render() {
     if (ImGui::CollapsingHeader("SubMeshes")) {
         for (size_t i = 0; i < subMeshes.size(); i++) {
             const auto& sub = subMeshes[i];
-            char label[64];
-            snprintf(label, sizeof(label), "SubMesh %d", (int)i);
+            char label[128];
+            if (!sub.name.empty())
+                snprintf(label, sizeof(label), "[%d] %s", (int)i, sub.name.c_str());
+            else
+                snprintf(label, sizeof(label), "SubMesh %d", (int)i);
             if (ImGui::TreeNode(label)) {
                 ImGui::Text("Material: %d", sub.materialIndex);
                 ImGui::Text("Indices: %u (start: %u)", sub.indexCount, sub.startIndex);
@@ -475,8 +518,12 @@ void App::Render() {
     ID3D12CommandList* commandLists[] = { m_commandList.Get() };
     m_commandQueue->ExecuteCommandLists(1, commandLists);
 
-    ThrowIfFailed(m_swapChain->Present(1, 0));
-    WaitForGpu();
+    ThrowIfFailed(m_swapChain->Present(m_vsync ? 1 : 0, 0));
+
+    // Signal the fence for this frame with a globally monotonic value — no CPU wait here
+    m_frameFenceValues[m_frameIndex] = m_nextFenceValue++;
+    ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), m_frameFenceValues[m_frameIndex]));
+
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 }
 
@@ -494,6 +541,8 @@ std::vector<BYTE> App::LoadShaderBlob(const std::string& filename) {
 
 void App::Cleanup() {
     WaitForGpu();
+    m_mesh.reset();
+    m_resourceManager.Shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

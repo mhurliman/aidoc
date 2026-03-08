@@ -22,8 +22,10 @@ add_executable(${PROJECT_NAME} WIN32
     src/App.cpp
     src/OrbitCamera.cpp
     src/FlyCamera.cpp
+    src/DescriptorHeap.cpp
+    src/Texture.cpp
     src/Mesh.cpp
-    src/Scene.cpp
+    src/ResourceManager.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp

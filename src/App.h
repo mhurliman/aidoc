@@ -10,14 +10,18 @@
 #include <wrl/client.h>
 #include <vector>
 #include <string>
+#include <memory>
 #include "FlyCamera.h"
-#include "Scene.h"
+#include "ResourceManager.h"
+#include "DescriptorHeap.h"
 
 using Microsoft::WRL::ComPtr;
 
+class Mesh;
+
 class App {
 public:
-    static const UINT FrameCount = 2;
+    static const UINT FrameCount = 3;
     static const UINT WindowWidth = 1280;
     static const UINT WindowHeight = 720;
 
@@ -61,21 +65,28 @@ private:
     ComPtr<ID3D12DescriptorHeap>        m_rtvHeap;
     UINT                                m_rtvDescriptorSize = 0;
     ComPtr<ID3D12Resource>              m_renderTargets[FrameCount];
-    ComPtr<ID3D12CommandAllocator>      m_commandAllocator;
+    ComPtr<ID3D12CommandAllocator>      m_commandAllocators[FrameCount];
     ComPtr<ID3D12GraphicsCommandList>   m_commandList;
     ComPtr<ID3D12RootSignature>         m_rootSignature;
     ComPtr<ID3D12PipelineState>         m_pipelineState;
     ComPtr<ID3D12DescriptorHeap>        m_dsvHeap;
     ComPtr<ID3D12Resource>              m_depthBuffer;
-    ComPtr<ID3D12DescriptorHeap>        m_srvHeap;
-    UINT                                m_srvDescriptorSize = 0;
     ComPtr<ID3D12Fence>                 m_fence;
-    UINT64                              m_fenceValue = 0;
+    UINT64                              m_nextFenceValue = 1;
+    UINT64                              m_frameFenceValues[FrameCount] = {};
     HANDLE                              m_fenceEvent = nullptr;
     UINT                                m_frameIndex = 0;
     D3D12_VIEWPORT                      m_viewport = {};
     D3D12_RECT                          m_scissorRect = {};
 
+    void WaitForFrame(UINT frameIndex);
+
     FlyCamera m_camera;
-    Scene m_scene;
+    float m_fps = 0.0f;
+    float m_fpsAccumulator = 0.0f;
+    int m_fpsFrameCount = 0;
+    ResourceManager m_resourceManager;
+    TransientDescriptorHeap m_transientHeap;
+    std::shared_ptr<Mesh> m_mesh;
+    bool m_vsync = false;
 };

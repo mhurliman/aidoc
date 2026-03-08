@@ -21,6 +21,8 @@ public:
     DirectX::XMMATRIX GetViewMatrix() const;
     DirectX::XMMATRIX GetProjectionMatrix() const;
     DirectX::XMFLOAT3 GetPosition() const { return m_position; }
+    float GetMoveSpeed() const { return m_moveSpeed; }
+    float& GetMoveSpeed() { return m_moveSpeed; }
 
 private:
     DirectX::XMFLOAT3 m_position = { 0.0f, 0.0f, -3.0f };
