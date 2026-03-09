@@ -2,7 +2,10 @@
 
 #include <DirectXMath.h>
 
-class OrbitCamera {
+class InputManager;
+
+class OrbitCamera
+{
 public:
     void SetPerspective(float fovY, float aspectRatio, float nearZ, float farZ);
     void SetDistance(float distance);
@@ -10,10 +13,7 @@ public:
     void SetZoomSpeed(float speed);
     void SetDistanceLimits(float minDist, float maxDist);
 
-    void OnMouseButtonDown(int button, int x, int y);
-    void OnMouseButtonUp(int button);
-    void OnMouseMove(int x, int y);
-    void OnMouseWheel(int delta);
+    void Update(float dt, const InputManager& input);
 
     DirectX::XMMATRIX GetViewMatrix() const;
     DirectX::XMMATRIX GetProjectionMatrix() const;
@@ -22,7 +22,7 @@ private:
     float m_yaw = 0.0f;
     float m_pitch = 0.0f;
     float m_distance = 10.0f;
-    DirectX::XMFLOAT3 m_target = { 0.0f, 0.0f, 0.0f };
+    DirectX::XMFLOAT3 m_target = {0.0f, 0.0f, 0.0f};
 
     float m_fovY = DirectX::XM_PIDIV4;
     float m_aspectRatio = 16.0f / 9.0f;
@@ -34,9 +34,4 @@ private:
     float m_zoomSpeed = 0.5f;
     float m_minDistance = 0.5f;
     float m_maxDistance = 50.0f;
-
-    bool m_orbiting = false;
-    bool m_panning = false;
-    int  m_lastMouseX = 0;
-    int  m_lastMouseY = 0;
 };

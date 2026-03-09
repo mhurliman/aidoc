@@ -18,13 +18,15 @@ using Microsoft::WRL::ComPtr;
 class Material;
 class ResourceManager;
 
-struct PbrVertex {
+struct PbrVertex
+{
     float position[3];
     float normal[3];
     float uv[2];
 };
 
-struct SubMesh {
+struct SubMesh
+{
     std::string name;
     UINT indexCount;
     UINT startIndex;
@@ -32,14 +34,14 @@ struct SubMesh {
     int materialIndex;
 };
 
-class Mesh : public IResource {
+class Mesh : public IResource
+{
 public:
     ~Mesh() override = default;
 
     // Parse glTF and create child Texture/Material resources via the ResourceManager.
     void LoadFromGltf(const std::string& path, ID3D12Device* device,
-                      ID3D12GraphicsCommandList* cmdList,
-                      ResourceManager& resMgr);
+                      ID3D12GraphicsCommandList* cmdList, ResourceManager& resMgr);
 
     D3D12_VERTEX_BUFFER_VIEW GetVertexBufferView() const { return m_vbv; }
     D3D12_INDEX_BUFFER_VIEW GetIndexBufferView() const { return m_ibv; }

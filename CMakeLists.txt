@@ -15,17 +15,31 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.91.8
 )
-FetchContent_MakeAvailable(tinygltf imgui)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(tinygltf imgui nlohmann_json)
 
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
     src/App.cpp
-    src/OrbitCamera.cpp
-    src/FlyCamera.cpp
-    src/DescriptorHeap.cpp
-    src/Texture.cpp
-    src/Mesh.cpp
-    src/ResourceManager.cpp
+    src/Renderer.cpp
+    src/helpers/InputManager.cpp
+    src/helpers/OrbitCamera.cpp
+    src/helpers/FlyCamera.cpp
+    src/helpers/DescriptorHeap.cpp
+    src/helpers/LinearAllocator.cpp
+    src/helpers/CommandContext.cpp
+    src/helpers/GraphicsContext.cpp
+    src/resources/ColorBuffer.cpp
+    src/resources/DepthBuffer.cpp
+    src/resources/Texture.cpp
+    src/resources/Material.cpp
+    src/resources/Mesh.cpp
+    src/resources/Scene.cpp
+    src/managers/ResourceManager.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -41,9 +55,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${imgui_SOURCE_DIR}/backends
 )
 
+target_compile_options(${PROJECT_NAME} PRIVATE /GR-)
+
+target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.h)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d12
     dxgi
+    nlohmann_json::nlohmann_json
 )
 
 # Find dxc shader compiler
@@ -105,5 +124,8 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/models
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/models
-    COMMENT "Copying shaders and models to output directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/scenes
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/scenes
+    COMMENT "Copying shaders, models, and scenes to output directory"
 )

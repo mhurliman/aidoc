@@ -9,11 +9,12 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include "IResource.h"
-#include "DescriptorHeap.h"
+#include "../helpers/DescriptorHeap.h"
 
 using Microsoft::WRL::ComPtr;
 
-class Texture : public IResource {
+class Texture : public IResource
+{
 public:
     ~Texture() override = default;
 

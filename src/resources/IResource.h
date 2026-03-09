@@ -1,6 +1,7 @@
 #pragma once
 
-class IResource {
+class IResource
+{
 public:
     virtual ~IResource() = default;
 };

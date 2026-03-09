@@ -1,18 +1,37 @@
-cbuffer SceneConstants : register(b0) {
+#define LIGHT_DIRECTIONAL 0
+#define LIGHT_POINT 1
+#define LIGHT_SPOT 2
+
+struct Light {
+    float3 color;
+    uint type;
+    float3 direction;
+    float linearFalloff;
+    float3 position;
+    float quadraticFalloff;
+    float spotAngleCos;
+    float3 _pad;
+};
+
+cbuffer FrameConstants : register(b0) {
     float4x4 viewProj;
     float3 cameraPos;
-    float roughness;
-    float3 lightDir;
-    float metallic;
+    int numLights;
+};
+
+cbuffer MaterialConstants : register(b1) {
     float4 baseColorFactor;
-    int hasTexture;
     float3 emissiveFactor;
+    float roughness;
+    float metallic;
+    int hasTexture;
     int hasEmissiveTexture;
-    float3 _pad;
+    float _matPad;
 };
 
 Texture2D baseColorTex : register(t0);
 Texture2D emissiveTex  : register(t1);
+StructuredBuffer<Light> lights : register(t2);
 SamplerState linearSampler : register(s0);
 
 struct VSInput {
@@ -58,11 +77,13 @@ float3 F_Schlick(float cosTheta, float3 F0) {
     return F0 + (1.0 - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
 
+float Attenuation(Light light, float dist) {
+    return 1.0 / (1.0 + light.linearFalloff * dist + light.quadraticFalloff * dist * dist);
+}
+
 float4 PSMain(PSInput input) : SV_TARGET {
     float3 N = normalize(input.worldNorm);
-    float3 L = normalize(lightDir);
     float3 V = normalize(cameraPos - input.worldPos);
-    float3 H = normalize(V + L);
 
     // Base color
     float4 baseColor = baseColorFactor;
@@ -73,26 +94,51 @@ float4 PSMain(PSInput input) : SV_TARGET {
     float3 albedo = baseColor.rgb;
     float alpha = baseColor.a;
 
-    // PBR
     float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
-
-    float NoH = max(dot(N, H), 0.0);
     float NoV = max(dot(N, V), 0.001);
-    float NoL = max(dot(N, L), 0.0);
-    float HoV = max(dot(H, V), 0.0);
 
-    // Cook-Torrance specular BRDF
-    float D = D_GGX(NoH, roughness);
-    float G = G_Smith(NoV, NoL, roughness);
-    float3 F = F_Schlick(HoV, F0);
+    float3 Lo = float3(0, 0, 0);
 
-    float3 specular = (D * G * F) / (4.0 * NoV * NoL + 0.001);
+    for (int i = 0; i < numLights; i++) {
+        Light light = lights[i];
 
-    // Energy-conserving diffuse
-    float3 kD = (1.0 - F) * (1.0 - metallic);
-    float3 diffuse = kD * albedo / PI;
+        float3 L;
+        float attenuation = 1.0;
 
-    float3 Lo = (diffuse + specular) * NoL;
+        if (light.type == LIGHT_DIRECTIONAL) {
+            L = normalize(light.direction);
+        } else {
+            float3 toLight = light.position - input.worldPos;
+            float dist = length(toLight);
+            L = toLight / dist;
+            attenuation = Attenuation(light, dist);
+
+            if (light.type == LIGHT_SPOT) {
+                float cosAngle = dot(-L, normalize(light.direction));
+                float outerCos = light.spotAngleCos;
+                float innerCos = lerp(outerCos, 1.0, 0.1);
+                attenuation *= saturate((cosAngle - outerCos) / (innerCos - outerCos));
+            }
+        }
+
+        float3 H = normalize(V + L);
+
+        float NoH = max(dot(N, H), 0.0);
+        float NoL = max(dot(N, L), 0.0);
+        float HoV = max(dot(H, V), 0.0);
+
+        float D = D_GGX(NoH, roughness);
+        float G = G_Smith(NoV, NoL, roughness);
+        float3 F = F_Schlick(HoV, F0);
+
+        float3 specular = (D * G * F) / (4.0 * NoV * NoL + 0.001);
+
+        float3 kD = (1.0 - F) * (1.0 - metallic);
+        float3 diffuse = kD * albedo / PI;
+
+        Lo += (diffuse + specular) * light.color * NoL * attenuation;
+    }
+
     float3 ambient = 0.03 * albedo;
 
     // Emissive

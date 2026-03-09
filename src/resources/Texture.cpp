@@ -1,18 +1,11 @@
 #include "Texture.h"
-#include <stdexcept>
-#include <string>
+#include "../helpers/Assert.h"
 #include <cstring>
 
-static inline void ThrowIfFailed(HRESULT hr, const char* msg) {
-    if (FAILED(hr)) {
-        throw std::runtime_error(std::string(msg) + " (hr=0x" +
-            std::to_string(hr) + ")");
-    }
-}
-
 void Texture::CreateFromPixels(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
-                                const uint8_t* pixels, int width, int height,
-                                PersistentDescriptorHeap& srvHeap) {
+                               const uint8_t* pixels, int width, int height,
+                               PersistentDescriptorHeap& srvHeap)
+{
     m_width = width;
     m_height = height;
 
@@ -30,17 +23,14 @@ void Texture::CreateFromPixels(ID3D12Device* device, ID3D12GraphicsCommandList* 
     texDesc.SampleDesc.Count = 1;
     texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
-    ThrowIfFailed(device->CreateCommittedResource(
-        &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-        IID_PPV_ARGS(&m_texture)),
-        "Failed to create texture");
+    ASSERT_SUCCEEDED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&m_texture)));
 
     // Get upload footprint
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     UINT64 uploadSize;
-    device->GetCopyableFootprints(&texDesc, 0, 1, 0,
-        &footprint, nullptr, nullptr, &uploadSize);
+    device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, nullptr, nullptr, &uploadSize);
 
     // Create upload buffer
     D3D12_HEAP_PROPERTIES uploadHeap = {};
@@ -55,23 +45,20 @@ void Texture::CreateFromPixels(ID3D12Device* device, ID3D12GraphicsCommandList* 
     uploadDesc.SampleDesc.Count = 1;
     uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    ThrowIfFailed(device->CreateCommittedResource(
-        &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&m_uploadBuffer)),
-        "Failed to create texture upload buffer");
+    ASSERT_SUCCEEDED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&m_uploadBuffer)));
 
     // Copy pixel data into upload buffer
     void* mapped = nullptr;
-    D3D12_RANGE readRange = { 0, 0 };
-    ThrowIfFailed(m_uploadBuffer->Map(0, &readRange, &mapped),
-        "Failed to map texture upload buffer");
+    D3D12_RANGE readRange = {0, 0};
+    ASSERT_SUCCEEDED(m_uploadBuffer->Map(0, &readRange, &mapped));
 
     uint8_t* dst = static_cast<uint8_t*>(mapped) + footprint.Offset;
     UINT srcRowPitch = width * 4;
-    for (int row = 0; row < height; row++) {
-        memcpy(dst + row * footprint.Footprint.RowPitch,
-               pixels + row * srcRowPitch, srcRowPitch);
+    for (int row = 0; row < height; row++)
+    {
+        memcpy(dst + row * footprint.Footprint.RowPitch, pixels + row * srcRowPitch, srcRowPitch);
     }
     m_uploadBuffer->Unmap(0, nullptr);
 

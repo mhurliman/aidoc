@@ -11,8 +11,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "IResource.h"
-#include "DescriptorHeap.h"
+#include "../resources/IResource.h"
+#include "../helpers/DescriptorHeap.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -20,19 +20,19 @@ class Texture;
 class Material;
 class Mesh;
 
-class ResourceManager {
+class ResourceManager
+{
 public:
     void Init(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);
     void Shutdown();
 
     // Load a top-level resource (e.g. a Mesh from a glTF file).
-    template<typename T>
-    std::shared_ptr<T> Load(const std::string& path);
+    template <typename T> std::shared_ptr<T> Load(const std::string& path);
 
     // Create child resources (called during Mesh::LoadFromGltf).
-    std::shared_ptr<Texture> CreateTexture(const std::string& key,
-        const uint8_t* pixels, int width, int height,
-        ID3D12Device* device, ID3D12GraphicsCommandList* cmdList);
+    std::shared_ptr<Texture> CreateTexture(const std::string& key, const uint8_t* pixels, int width,
+                                           int height, ID3D12Device* device,
+                                           ID3D12GraphicsCommandList* cmdList);
 
     std::shared_ptr<Material> CreateMaterial(const std::string& key);
 
@@ -60,7 +60,8 @@ private:
     std::unordered_map<std::string, std::shared_ptr<IResource>> m_cache;
 
     // Deferred deletion queue
-    struct PendingDeletion {
+    struct PendingDeletion
+    {
         UINT64 fenceValue;
         std::shared_ptr<IResource> resource;
     };
