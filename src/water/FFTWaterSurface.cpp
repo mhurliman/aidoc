@@ -3,10 +3,15 @@
 
 #include <fstream>
 #include <vector>
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <DirectXMath.h>
 #include <stb_image.h>
+
+#undef min
+#undef max
 
 using namespace DirectX;
 
@@ -83,7 +88,9 @@ void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc)
     CreateTextures();
     CreateDescriptorHeap();
     BuildDescriptorTables();
+    tweaks.meshResolution = desc.MeshResolution;
     CreateMesh();
+    m_lastMeshResolution = desc.MeshResolution;
     GenerateNoise();
 }
 
@@ -117,8 +124,11 @@ void FFTWaterSurface::CreatePSOs()
     IFFTVerticalStepPSO  = CreateComputePSO(m_device, m_computeRootSig.Get(), "ifft_vert_cs.cso");
     PermutePSO           = CreateComputePSO(m_device, m_computeRootSig.Get(), "permute_cs.cso");
 
-    auto vsBlob = ReadShaderBlob("water_surface_vs.cso");
-    auto psBlob = ReadShaderBlob("water_surface_ps.cso");
+    auto vsBlob     = ReadShaderBlob("water_surface_vs.cso");
+    auto vsFullBlob = ReadShaderBlob("water_surface_vs_full.cso");
+    auto hsBlob     = ReadShaderBlob("water_surface_hs.cso");
+    auto dsBlob     = ReadShaderBlob("water_surface_ds.cso");
+    auto psBlob     = ReadShaderBlob("water_surface_ps.cso");
 
     D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
@@ -143,19 +153,39 @@ void FFTWaterSurface::CreatePSOs()
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gpsDesc = {};
     gpsDesc.pRootSignature        = m_renderRootSig.Get();
     gpsDesc.VS                    = { vsBlob.data(), vsBlob.size() };
+    gpsDesc.HS                    = { hsBlob.data(), hsBlob.size() };
+    gpsDesc.DS                    = { dsBlob.data(), dsBlob.size() };
     gpsDesc.PS                    = { psBlob.data(), psBlob.size() };
     gpsDesc.InputLayout           = { inputLayout, _countof(inputLayout) };
     gpsDesc.RasterizerState       = rasterDesc;
     gpsDesc.DepthStencilState     = dsDesc;
     gpsDesc.BlendState            = blendDesc;
     gpsDesc.SampleMask            = UINT_MAX;
-    gpsDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    gpsDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     gpsDesc.NumRenderTargets      = 1;
     gpsDesc.RTVFormats[0]         = DXGI_FORMAT_R8G8B8A8_UNORM;
     gpsDesc.DSVFormat             = DXGI_FORMAT_D32_FLOAT;
     gpsDesc.SampleDesc.Count      = 1;
 
     ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&gpsDesc, IID_PPV_ARGS(&WaterRenderPSO)));
+
+    rasterDesc.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    gpsDesc.RasterizerState = rasterDesc;
+    ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&gpsDesc, IID_PPV_ARGS(&WaterWireframePSO)));
+
+    // Flat (non-tessellated) PSOs: VS_Full + PS, no HS/DS, triangle topology.
+    gpsDesc.VS                    = { vsFullBlob.data(), vsFullBlob.size() };
+    gpsDesc.HS                    = {};
+    gpsDesc.DS                    = {};
+    gpsDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
+    gpsDesc.RasterizerState = rasterDesc;
+    ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&gpsDesc, IID_PPV_ARGS(&WaterFlatPSO)));
+
+    rasterDesc.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    gpsDesc.RasterizerState = rasterDesc;
+    ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&gpsDesc, IID_PPV_ARGS(&WaterFlatWireframePSO)));
 }
 
 // ---------------------------------------------------------------------------
@@ -321,10 +351,23 @@ void FFTWaterSurface::BuildDescriptorTables()
 // Water mesh (tessellated grid)
 // ---------------------------------------------------------------------------
 
+void FFTWaterSurface::RebuildMeshIfNeeded()
+{
+    int desired = tweaks.meshResolution;
+    if (desired == m_lastMeshResolution)
+        return;
+    desired = std::max(2, desired);
+    tweaks.meshResolution = desired;
+    m_desc.MeshResolution = desired;
+    CreateMesh();
+    m_lastMeshResolution = desired;
+}
+
 void FFTWaterSurface::CreateMesh()
 {
-    int N = m_desc.N;
-    int M = m_desc.M;
+    // Coarse base grid; tessellation fills in geometric detail near the camera.
+    const int N = m_desc.MeshResolution;
+    const int M = m_desc.MeshResolution;
 
     struct Vertex { float x, y, z, u, v; };
     std::vector<Vertex> verts;
@@ -338,22 +381,45 @@ void FFTWaterSurface::CreateMesh()
                               (v - 0.5f) * m_desc.TileSize, u, v });
         }
 
+    // 4-index quad patches: [TL, BL, TR, BR] per quad.
     std::vector<uint32_t> indices;
-    indices.reserve((size_t)(N - 1) * (M - 1) * 6);
+    indices.reserve((size_t)(N - 1) * (M - 1) * 4);
     for (int row = 0; row < M - 1; ++row)
         for (int col = 0; col < N - 1; ++col)
         {
             uint32_t tl = row * N + col;
-            indices.push_back(tl);     indices.push_back(tl + N); indices.push_back(tl + 1);
-            indices.push_back(tl + 1); indices.push_back(tl + N); indices.push_back(tl + N + 1);
+            indices.push_back(tl);         // TL
+            indices.push_back(tl + N);     // BL
+            indices.push_back(tl + 1);     // TR
+            indices.push_back(tl + N + 1); // BR
         }
 
     m_indexCount = static_cast<uint32_t>(indices.size());
+
+    // Triangle-list index buffer for the non-tessellated path.
+    std::vector<uint32_t> triIndices;
+    triIndices.reserve((size_t)(N - 1) * (M - 1) * 6);
+    for (int row = 0; row < M - 1; ++row)
+        for (int col = 0; col < N - 1; ++col)
+        {
+            uint32_t tl = row * N + col;
+            // Upper-left triangle
+            triIndices.push_back(tl);
+            triIndices.push_back(tl + N);
+            triIndices.push_back(tl + 1);
+            // Lower-right triangle
+            triIndices.push_back(tl + 1);
+            triIndices.push_back(tl + N);
+            triIndices.push_back(tl + N + 1);
+        }
+    m_indexCountFlat = static_cast<uint32_t>(triIndices.size());
 
     m_meshVertex.CreateAndUpload(m_device, verts.data(),
                                   verts.size() * sizeof(Vertex), sizeof(Vertex));
     m_meshIndex.CreateAndUpload(m_device, indices.data(),
                                  indices.size() * sizeof(uint32_t), DXGI_FORMAT_R32_UINT);
+    m_meshIndexFlat.CreateAndUpload(m_device, triIndices.data(),
+                                     triIndices.size() * sizeof(uint32_t), DXGI_FORMAT_R32_UINT);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +455,8 @@ void FFTWaterSurface::GenerateNoise()
                                                        D3D12_RESOURCE_STATE_GENERIC_READ,
                                                        nullptr, IID_PPV_ARGS(&m_noiseUpload)));
 
+    m_noiseCpu.resize((size_t)N * N);
+
     uint8_t* mapped = nullptr;
     m_noiseUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
     srand(12345);
@@ -401,8 +469,11 @@ void FFTWaterSurface::GenerateNoise()
             float u1 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
             float u2 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
             float mag = sqrtf(-2.0f * logf(u1));
-            row[x * 2 + 0] = mag * cosf(6.28318530f * u2);
-            row[x * 2 + 1] = mag * sinf(6.28318530f * u2);
+            float gx = mag * cosf(6.28318530f * u2);
+            float gy = mag * sinf(6.28318530f * u2);
+            row[x * 2 + 0] = gx;
+            row[x * 2 + 1] = gy;
+            m_noiseCpu[y * N + x] = { gx, gy };
         }
     }
     m_noiseUpload->Unmap(0, nullptr);
@@ -525,6 +596,201 @@ void FFTWaterSurface::LoadEnvironmentMap(ID3D12CommandQueue* queue, const std::s
     srvDesc.TextureCube.MipLevels     = 1;
     m_device->CreateShaderResourceView(m_envCubeMap.Get(), &srvDesc,
                                        CpuHandle(kRenderTable + 5));
+}
+
+// ---------------------------------------------------------------------------
+// CPU height sampling (low-frequency Tessendorf sum)
+// ---------------------------------------------------------------------------
+
+float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsedTime, int modes) const
+{
+    if (m_noiseCpu.empty())
+        return 0.0f;
+
+    const float Pi     = 3.14159265f;
+    const float g      = 9.81f;
+    const float time   = elapsedTime * tweaks.timeScale + 60.0f;
+    const int   N      = m_desc.N;
+    const int   halfN  = N / 2;
+    const float DeltaK = 2.0f * Pi / m_desc.TileSize;
+    const float HalfScale = (1.0f / m_desc.TileSize) * 0.5f;
+
+    const float L         = tweaks.windSpeed * tweaks.windSpeed / g;
+    const float windCosT  = cosf(tweaks.windTheta);
+    const float windSinT  = sinf(tweaks.windTheta);
+
+    // Evaluate Phillips(k) — mirrors PhillipsSpectrum.hlsl
+    auto phillips = [&](float kx, float kz) -> float
+    {
+        float k2 = kx * kx + kz * kz;
+        if (k2 < 1e-8f) return 0.0f;
+        float kLen = sqrtf(k2);
+        float kL2  = k2 * L * L;
+        float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
+        float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
+        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+    };
+
+    float height = 0.0f;
+
+    for (int nz = -modes; nz <= modes; ++nz)
+    {
+        for (int nx = -modes; nx <= modes; ++nx)
+        {
+            if (nx == 0 && nz == 0) continue;
+
+            float kx = nx * DeltaK;
+            float kz = nz * DeltaK;
+
+            // Texture indices for k and -k, matching PhillipsSpectrum.hlsl addressing
+            int tx  = ((  nx + halfN) % N + N) % N;
+            int tz  = ((  nz + halfN) % N + N) % N;
+            int mtx = (( -nx + halfN) % N + N) % N;
+            int mtz = (( -nz + halfN) % N + N) % N;
+
+            XMFLOAT2 noiseK    = m_noiseCpu[tz  * N + tx];
+            XMFLOAT2 noiseMinK = m_noiseCpu[mtz * N + mtx];
+
+            float phiK    = sqrtf(phillips( kx,  kz) * 0.5f);
+            float phiMinK = sqrtf(phillips(-kx, -kz) * 0.5f);
+
+            // h0(k) and conj(h0(-k)) — mirrors PhillipsSpectrum.hlsl
+            float h0Kx  =  noiseK.x    * phiK;
+            float h0Ky  =  noiseK.y    * phiK;
+            float h0mKx =  noiseMinK.x * phiMinK;
+            float h0mKy = -noiseMinK.y * phiMinK; // conjugate
+
+            // Dispersion: omega = sqrt(|k| * g)
+            float omega = sqrtf(sqrtf(kx*kx + kz*kz) * g);
+            float eRe = cosf(omega * time);
+            float eIm = sinf(omega * time);
+
+            // h(k,t) = h0(k)*exp(i*omega*t) + conj(h0(-k))*exp(-i*omega*t)
+            // mirrors DynamicSpectrum.hlsl ComplexMult(h0.xy, E) + ComplexMult(h0.zw, conj(E))
+            float hRe = (h0Kx*eRe - h0Ky*eIm) + (h0mKx*eRe + h0mKy*eIm);
+            float hIm = (h0Kx*eIm + h0Ky*eRe) + (-h0mKx*eIm + h0mKy*eRe);
+
+            // Accumulate real part of h(k,t) * exp(i*k·x)
+            float kDotX = kx * worldX + kz * worldZ;
+            height += hRe * cosf(kDotX) - hIm * sinf(kDotX);
+        }
+    }
+
+    return height * HalfScale;
+}
+
+// ---------------------------------------------------------------------------
+// CpuHeightfield — pyramid build, bilinear sample, hierarchical range query
+// ---------------------------------------------------------------------------
+
+void FFTWaterSurface::CpuHeightfield::BuildPyramid()
+{
+    // Level 0: one min/max cell per height sample
+    for (int i = 0; i < kGridN * kGridN; ++i)
+        hiz[0][i] = { heights[i], heights[i] };
+
+    // Each subsequent level merges 2×2 blocks from the level below
+    for (int lvl = 1; lvl < kMips; ++lvl)
+    {
+        int n  = kGridN >> lvl;
+        int pn = n * 2;
+        for (int z = 0; z < n; ++z)
+            for (int x = 0; x < n; ++x)
+            {
+                float mn = FLT_MAX, mx = -FLT_MAX;
+                for (int dz = 0; dz < 2; ++dz)
+                    for (int dx = 0; dx < 2; ++dx)
+                    {
+                        const auto& p = hiz[lvl - 1][(z * 2 + dz) * pn + (x * 2 + dx)];
+                        mn = std::min(mn, p.mn);
+                        mx = std::max(mx, p.mx);
+                    }
+                hiz[lvl][z * n + x] = { mn, mx };
+            }
+    }
+
+    // Global bounds from the coarsest level (2×2 = 4 cells)
+    globalMin = FLT_MAX;
+    globalMax = -FLT_MAX;
+    const int cn = kGridN >> (kMips - 1);
+    for (int i = 0; i < cn * cn; ++i)
+    {
+        globalMin = std::min(globalMin, hiz[kMips - 1][i].mn);
+        globalMax = std::max(globalMax, hiz[kMips - 1][i].mx);
+    }
+}
+
+float FFTWaterSurface::CpuHeightfield::Sample(
+    float worldX, float worldZ, float tileSize) const
+{
+    float u = fmodf(worldX / tileSize, 1.0f); if (u < 0.0f) u += 1.0f;
+    float v = fmodf(worldZ / tileSize, 1.0f); if (v < 0.0f) v += 1.0f;
+
+    float gx = u * kGridN;
+    float gz = v * kGridN;
+    int   x0 = (int)gx % kGridN,  x1 = (x0 + 1) % kGridN;
+    int   z0 = (int)gz % kGridN,  z1 = (z0 + 1) % kGridN;
+    float fx = gx - floorf(gx),   fz = gz - floorf(gz);
+
+    return heights[z0 * kGridN + x0] * (1.0f - fx) * (1.0f - fz)
+         + heights[z0 * kGridN + x1] *         fx  * (1.0f - fz)
+         + heights[z1 * kGridN + x0] * (1.0f - fx) *         fz
+         + heights[z1 * kGridN + x1] *         fx  *         fz;
+}
+
+std::pair<float, float> FFTWaterSurface::CpuHeightfield::QueryRange(
+    float x0, float z0, float x1, float z1, float tileSize) const
+{
+    float extX = x1 - x0, extZ = z1 - z0;
+    if (extX >= tileSize || extZ >= tileSize)
+        return { globalMin, globalMax };
+
+    // Walk from finest to coarsest; stop at the first level where the footprint
+    // fits within a 3×3 cell block (≤ 9 lookups).
+    int lvl = kMips - 1;
+    for (int l = 0; l < kMips; ++l)
+    {
+        int n      = kGridN >> l;
+        int cellsX = (int)ceilf(extX / tileSize * n) + 2;
+        int cellsZ = (int)ceilf(extZ / tileSize * n) + 2;
+        if (cellsX <= 3 && cellsZ <= 3) { lvl = l; break; }
+    }
+
+    int   n   = kGridN >> lvl;
+    float uf0 = fmodf(x0 / tileSize, 1.0f); if (uf0 < 0.0f) uf0 += 1.0f;
+    float vf0 = fmodf(z0 / tileSize, 1.0f); if (vf0 < 0.0f) vf0 += 1.0f;
+
+    int cx0 = (int)(uf0 * n);
+    int cz0 = (int)(vf0 * n);
+    int cx1 = cx0 + (int)ceilf(extX / tileSize * n) + 1;
+    int cz1 = cz0 + (int)ceilf(extZ / tileSize * n) + 1;
+
+    float mn = FLT_MAX, mx = -FLT_MAX;
+    for (int cz = cz0; cz <= cz1; ++cz)
+        for (int cx = cx0; cx <= cx1; ++cx)
+        {
+            const auto& cell = hiz[lvl][(cz % n) * n + (cx % n)];
+            mn = std::min(mn, cell.mn);
+            mx = std::max(mx, cell.mx);
+        }
+    return { mn, mx };
+}
+
+// ---------------------------------------------------------------------------
+// BuildHeightfield — populate the CpuHeightfield cache for the current frame
+// ---------------------------------------------------------------------------
+
+void FFTWaterSurface::BuildHeightfield(float elapsedTime, int modes)
+{
+    const int kN = CpuHeightfield::kGridN;
+    for (int zi = 0; zi < kN; ++zi)
+        for (int xi = 0; xi < kN; ++xi)
+        {
+            float wx = float(xi) / kN * m_desc.TileSize;
+            float wz = float(zi) / kN * m_desc.TileSize;
+            m_heightfield.heights[zi * kN + xi] = SampleHeightCPU(wx, wz, elapsedTime, modes);
+        }
+    m_heightfield.BuildPyramid();
 }
 
 // ---------------------------------------------------------------------------
@@ -725,9 +991,13 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
     }
 
     // ---- Transition final maps to SRV for Render ----
-    ctx.TransitionResource(m_heightMap, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ctx.TransitionResource(m_gradMap,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ctx.TransitionResource(m_dispMap,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // Include NON_PIXEL_SHADER_RESOURCE so the non-tess VS can also read them.
+    const D3D12_RESOURCE_STATES kSrvAll =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ctx.TransitionResource(m_heightMap, kSrvAll);
+    ctx.TransitionResource(m_gradMap,   kSrvAll);
+    ctx.TransitionResource(m_dispMap,   kSrvAll);
     ctx.FlushResourceBarriers();
 }
 
@@ -747,7 +1017,11 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
 
     ctx.SetDescriptorHeap(m_heap.Get());
     ctx.SetRootSignature(m_renderRootSig.Get());
-    ctx.SetPipelineState(WaterRenderPSO.Get());
+
+    if (tweaks.tessellation)
+        ctx.SetPipelineState(tweaks.wireframe ? WaterWireframePSO.Get() : WaterRenderPSO.Get());
+    else
+        ctx.SetPipelineState(tweaks.wireframe ? WaterFlatWireframePSO.Get() : WaterFlatPSO.Get());
 
     auto frameAlloc = alloc.Allocate(sizeof(WaterFrameConstants));
     WaterFrameConstants fc = {};
@@ -758,21 +1032,48 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
     memcpy(frameAlloc.cpuAddress, &fc, sizeof(fc));
     ctx.SetConstantBufferView(0, frameAlloc.gpuAddress);
 
-    auto waterAlloc = alloc.Allocate(sizeof(WaterConstants));
-    WaterConstants wc = {};
-    XMStoreFloat4x4(&wc.WorldMat, XMMatrixTranspose(XMMatrixIdentity()));
-    wc.WorldViewProjMat = view.viewProjMatrix;
-    wc.Color            = tweaks.color;
-    wc.TileSize         = m_desc.TileSize;
-    wc.RcpTileSize      = 1.0f / m_desc.TileSize;
-    memcpy(waterAlloc.cpuAddress, &wc, sizeof(wc));
-    ctx.SetConstantBufferView(1, waterAlloc.gpuAddress);
+    // Build a template WaterConstants with fields that are the same for every tile.
+    WaterConstants wcBase = {};
+    wcBase.WorldViewProjMat = view.viewProjMatrix; // plain ViewProj; WorldMat carries tile offset
+    wcBase.Color            = tweaks.color;
+    wcBase.TileSize         = m_desc.TileSize;
+    wcBase.RcpTileSize      = 1.0f / m_desc.TileSize;
+    wcBase.MaxTessellation  = tweaks.maxTessellation;
+    wcBase.TessDistance     = tweaks.tessDistance;
 
     ctx.SetDescriptorTable(2, GpuHandle(kRenderTable));
     ctx.SetDescriptorTable(3, GpuHandle(kRenderTable + 3));
 
     ctx.SetVertexBuffer(m_meshVertex.GetView());
-    ctx.SetIndexBuffer(m_meshIndex.GetView());
-    ctx.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx.DrawIndexedInstanced(m_indexCount, 1, 0, 0, 0);
+    if (tweaks.tessellation)
+    {
+        ctx.SetIndexBuffer(m_meshIndex.GetView());
+        ctx.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST);
+    }
+    else
+    {
+        ctx.SetIndexBuffer(m_meshIndexFlat.GetView());
+        ctx.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
+
+    // Tiles are laid out symmetrically around the origin.
+    // tileCount=1 → single tile; tileCount=3 → 3×3 grid, etc.
+    int half = tweaks.tileCount / 2;
+    for (int tz = -half; tz <= half; ++tz)
+    {
+        for (int tx = -half; tx <= half; ++tx)
+        {
+            WaterConstants wc = wcBase;
+            XMMATRIX worldMat = XMMatrixTranslation(
+                tx * m_desc.TileSize, 0.0f, tz * m_desc.TileSize);
+            XMStoreFloat4x4(&wc.WorldMat, XMMatrixTranspose(worldMat));
+
+            auto waterAlloc = alloc.Allocate(sizeof(WaterConstants));
+            memcpy(waterAlloc.cpuAddress, &wc, sizeof(wc));
+            ctx.SetConstantBufferView(1, waterAlloc.gpuAddress);
+
+            ctx.DrawIndexedInstanced(
+                tweaks.tessellation ? m_indexCount : m_indexCountFlat, 1, 0, 0, 0);
+        }
+    }
 }

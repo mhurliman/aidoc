@@ -30,6 +30,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/util/OrbitCamera.cpp
     src/util/FlyCamera.cpp
     src/gfx/DescriptorHeap.cpp
+    src/gfx/GpuProfiler.cpp
     src/gfx/LinearAllocator.cpp
     src/gfx/CommandContext.cpp
     src/gfx/ComputeContext.cpp
@@ -191,6 +192,39 @@ add_custom_command(
     VERBATIM
 )
 list(APPEND SHADER_OUTPUTS ${WATER_VS_OUTPUT})
+
+set(WATER_VS_FULL_OUTPUT "${SHADER_OUTPUT_DIR}/water_surface_vs_full.cso")
+add_custom_command(
+    OUTPUT ${WATER_VS_FULL_OUTPUT}
+    COMMAND ${DXC_EXECUTABLE} -T vs_6_0 -E VSMain ${DXC_SHADER_FLAGS} -Fo ${WATER_VS_FULL_OUTPUT}
+            "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceVS_Full.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceVS_Full.hlsl" ${WATER_COMMON_INC}
+    COMMENT "Compiling VS: water_surface_vs_full"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${WATER_VS_FULL_OUTPUT})
+
+set(WATER_HS_OUTPUT "${SHADER_OUTPUT_DIR}/water_surface_hs.cso")
+add_custom_command(
+    OUTPUT ${WATER_HS_OUTPUT}
+    COMMAND ${DXC_EXECUTABLE} -T hs_6_0 -E HSMain ${DXC_SHADER_FLAGS} -Fo ${WATER_HS_OUTPUT}
+            "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceHS.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceHS.hlsl" ${WATER_COMMON_INC}
+    COMMENT "Compiling HS: water_surface"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${WATER_HS_OUTPUT})
+
+set(WATER_DS_OUTPUT "${SHADER_OUTPUT_DIR}/water_surface_ds.cso")
+add_custom_command(
+    OUTPUT ${WATER_DS_OUTPUT}
+    COMMAND ${DXC_EXECUTABLE} -T ds_6_0 -E DSMain ${DXC_SHADER_FLAGS} -Fo ${WATER_DS_OUTPUT}
+            "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceDS.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Water/WaterSurfaceDS.hlsl" ${WATER_COMMON_INC}
+    COMMENT "Compiling DS: water_surface"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${WATER_DS_OUTPUT})
 
 set(WATER_PS_OUTPUT "${SHADER_OUTPUT_DIR}/water_surface_ps.cso")
 add_custom_command(

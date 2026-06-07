@@ -281,6 +281,8 @@ void App::Render()
 {
     WaitForFrame(m_frameIndex);
 
+    m_scene.GetWaterSurface().RebuildMeshIfNeeded();
+
     auto& rt = m_displayBuffers[m_frameIndex];
 
     m_renderer->BeginFrame(m_commandAllocators[m_frameIndex].Get(), rt, m_depthBuffer, m_viewport,
@@ -306,6 +308,8 @@ void App::Render()
     m_renderer->RenderScene(m_scene, view, frameConstants, m_elapsedTime);
 
     // ImGui
+    m_renderer->GetProfiler().BeginScope("ImGui", m_renderer->GetCommandList());
+
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -401,20 +405,65 @@ void App::Render()
         const auto& desc = water.GetDesc();
 
         ImGui::Checkbox("Visible##water", &tweaks.visible);
+        ImGui::SameLine();
+        ImGui::Checkbox("Tessellation", &tweaks.tessellation);
+        ImGui::SameLine();
+        ImGui::Checkbox("Wireframe", &tweaks.wireframe);
+        ImGui::SliderInt("Tile Count",      &tweaks.tileCount,      1,  9);
+        ImGui::SliderInt("Mesh Resolution", &tweaks.meshResolution, 4, 64);
         ImGui::SliderFloat("Wind Speed",        &tweaks.windSpeed,       0.1f, 100.0f);
         ImGui::SliderAngle("Wind Direction",    &tweaks.windTheta,       -180.0f, 180.0f);
         ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.01f, 5.0f);
         ImGui::SliderFloat("Small Wave Cutoff", &tweaks.smallWaveCutoff, 0.001f, 0.1f, "%.4f");
         ImGui::SliderFloat("Choppiness",        &tweaks.choppiness,      0.0f,   1.0f);
         ImGui::SliderFloat("Time Scale",        &tweaks.timeScale,       0.0f,   2.0f);
+        ImGui::SliderFloat("Max Tess",          &tweaks.maxTessellation, 1.0f,  64.0f);
+        ImGui::SliderFloat("Tess Distance",     &tweaks.tessDistance,    5.0f, 200.0f);
         ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
-        ImGui::Text("Grid: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
+        ImGui::TextDisabled("FFT: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
     }
 
     ImGui::End();
 
+    // GPU Timings window
+    ImGui::Begin("GPU Timings");
+    const auto& gpuResults = m_renderer->GetProfiler().GetResults();
+    if (gpuResults.empty())
+    {
+        ImGui::TextDisabled("Waiting for GPU data...");
+    }
+    else
+    {
+        float totalMs = 1.0f;
+        for (const auto& r : gpuResults)
+            if (strcmp(r.name, "Total Frame") == 0) { totalMs = r.ms; break; }
+
+        if (ImGui::BeginTable("gpu_timings", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
+        {
+            ImGui::TableSetupColumn("Scope", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("ms",    ImGuiTableColumnFlags_WidthFixed,  52.0f);
+            ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+
+            for (const auto& r : gpuResults)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(r.name);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.3f", r.ms);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::ProgressBar(r.ms / totalMs, ImVec2(-1.0f, 0.0f), "");
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_renderer->GetCommandList());
+    m_renderer->GetProfiler().EndScope(m_renderer->GetCommandList()); // ImGui
 
     m_frameFenceValues[m_frameIndex] = m_renderer->EndFrame(rt, m_fence.Get(), m_nextFenceValue);
 

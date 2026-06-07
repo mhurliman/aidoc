@@ -44,10 +44,11 @@ static ComPtr<ID3D12RootSignature> LoadRootSignature(ID3D12Device* device, const
 
 void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameCount)
 {
-    m_device = device;
+    m_device     = device;
     m_frameCount = frameCount;
 
     m_gfxContext.Init(device, queue);
+    m_profiler.Init(device, queue, (int)frameCount);
 
     m_resourceManager.Init(device, queue);
     m_transientHeap.Init(device, 1024, 1);
@@ -83,6 +84,7 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
                           const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor,
                           UINT frameIndex, UINT64 completedFenceValue)
 {
+    m_frameIndex = frameIndex;
     m_resourceManager.ProcessDeferredDeletions(completedFenceValue);
 
     m_linearAllocator.SetCurrentFrame(frameIndex);
@@ -115,6 +117,11 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
     }
 
     m_gfxContext.Begin(allocator);
+
+    auto* cmd = m_gfxContext.GetCommandList();
+    m_profiler.BeginFrame((int)frameIndex, cmd);
+    m_profiler.BeginScope("Total Frame", cmd);
+
     m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
     m_gfxContext.SetRootSignature(m_rootSignature.Get());
     m_gfxContext.SetViewportAndScissor(viewport, scissor);
@@ -161,6 +168,8 @@ void Renderer::RenderScene(Scene& scene, const View& view,
 
     m_gfxContext.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+    auto* cmd = m_gfxContext.GetCommandList();
+    m_profiler.BeginScope("Opaque Meshes", cmd);
     for (const auto& entity : scene.GetEntities())
     {
         if (!entity.visible)
@@ -178,6 +187,7 @@ void Renderer::RenderScene(Scene& scene, const View& view,
             m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, sub.baseVertex, 0);
         }
     }
+    m_profiler.EndScope(cmd);
 
     // Extract light direction from first directional light, fall back to a default.
     DirectX::XMFLOAT3 lightDir = { -0.3f, -1.0f, 0.5f };
@@ -185,7 +195,9 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         lightDir = scene.GetDirectionalLights()[0].direction;
 
     auto& water = scene.GetWaterSurface();
+    m_profiler.BeginScope("FFT Update", cmd);
     water.Update(m_gfxContext, m_linearAllocator, elapsedTime);
+    m_profiler.EndScope(cmd);
 
     // Restore renderer state after water compute passes swap the descriptor heap.
     m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
@@ -193,7 +205,7 @@ void Renderer::RenderScene(Scene& scene, const View& view,
 
     if (water.tweaks.visible)
     {
-        // Copy scene color into the snapshot buffer for water refraction sampling.
+        m_profiler.BeginScope("Scene Copy", cmd);
         m_gfxContext.TransitionResource(*m_currentRT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_gfxContext.TransitionResource(m_sceneColorCopy, D3D12_RESOURCE_STATE_COPY_DEST);
         m_gfxContext.FlushResourceBarriers();
@@ -201,8 +213,9 @@ void Renderer::RenderScene(Scene& scene, const View& view,
                                                     m_currentRT->GetResource());
         m_gfxContext.TransitionResource(*m_currentRT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         m_gfxContext.TransitionResource(m_sceneColorCopy, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_profiler.EndScope(cmd);
 
-        // Transition depth to combined read state so the water PS can sample it.
+        m_profiler.BeginScope("Water Render", cmd);
         m_gfxContext.TransitionResource(*m_currentDS,
             D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -210,6 +223,7 @@ void Renderer::RenderScene(Scene& scene, const View& view,
                      m_currentDS->GetSRV(), m_sceneColorSRVHandle);
 
         m_gfxContext.TransitionResource(*m_currentDS, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        m_profiler.EndScope(cmd);
 
         // Restore renderer heap again after water render.
         m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
@@ -219,6 +233,10 @@ void Renderer::RenderScene(Scene& scene, const View& view,
 
 UINT64 Renderer::EndFrame(ColorBuffer& rt, ID3D12Fence* fence, UINT64& nextFenceValue)
 {
+    auto* cmd = m_gfxContext.GetCommandList();
+    m_profiler.EndScope(cmd);   // Total Frame
+    m_profiler.EndFrame(cmd);   // ResolveQueryData
+
     m_gfxContext.TransitionResource(rt, D3D12_RESOURCE_STATE_PRESENT);
     return m_gfxContext.Finish(fence, nextFenceValue);
 }

@@ -2,6 +2,7 @@
 
 #include "IRenderer.h"
 #include "gfx/GraphicsContext.h"
+#include "gfx/GpuProfiler.h"
 #include "gfx/LinearAllocator.h"
 #include "gfx/DescriptorHeap.h"
 #include "gfx/PixelBuffer.h"
@@ -33,18 +34,21 @@ public:
     ResourceManager& GetResourceManager() { return m_resourceManager; }
     TransientDescriptorHeap& GetTransientHeap() { return m_transientHeap; }
     ID3D12GraphicsCommandList* GetCommandList() { return m_gfxContext.GetCommandList(); }
+    GpuProfiler& GetProfiler() { return m_profiler; }
 
 private:
     void InitShaders();
 
-    ID3D12Device* m_device = nullptr;
+    ID3D12Device* m_device        = nullptr;
+    UINT          m_frameCount    = 0;
+    UINT          m_frameIndex    = 0;
     GraphicsContext m_gfxContext;
+    GpuProfiler   m_profiler;
     LinearAllocator m_linearAllocator;
     TransientDescriptorHeap m_transientHeap;
     ResourceManager m_resourceManager;
     ComPtr<ID3D12RootSignature> m_rootSignature;
     D3D12_CPU_DESCRIPTOR_HANDLE m_nullSrvHandle = {};
-    UINT m_frameCount = 0;
 
     ColorBuffer* m_currentRT = nullptr;
     DepthBuffer* m_currentDS = nullptr;

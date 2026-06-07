@@ -4,6 +4,8 @@
 #include <wrl/client.h>
 #include <DirectXMath.h>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "gfx/CommandContext.h"
 #include "gfx/GraphicsContext.h"
@@ -19,6 +21,7 @@ struct WaterDesc
     int N;
     int M;
     float TileSize;
+    int MeshResolution = 16;  // base grid vertices per side before tessellation
 };
 
 class FFTWaterSurface
@@ -32,15 +35,52 @@ public:
         float smallWaveCutoff = 0.01f;
         float choppiness      = 0.5f;   // λ: horizontal displacement scale [0,1]
         float timeScale       = 0.5f;   // slows or speeds up wave animation
+        float maxTessellation = 32.0f;  // peak tessellation factor near camera
+        float tessDistance    = 30.0f;  // distance (m) at which tessellation reaches 1
         DirectX::XMFLOAT3 color = { 0.05f, 0.3f, 0.5f };
         bool  visible         = true;
+        bool  wireframe       = false;
+        int   tileCount       = 3;      // tiles per side; 1=single, 3=3×3 grid, etc.
+        int   meshResolution  = 16;     // base grid vertices per side (runtime-changeable)
+        bool  tessellation    = true;   // use HS/DS tessellation; false = plain VS + triangle list
     };
 
     WaterTweaks tweaks;
 
+    // CPU-side heightfield cache for buoyancy and other gameplay queries.
+    // Call BuildHeightfield() once per frame; then query via GetHeightfield().
+    struct CpuHeightfield
+    {
+        static constexpr int kGridN = 32;  // samples per tile side
+        static constexpr int kMips  = 5;   // pyramid levels: 32→16→8→4→2
+
+        struct MinMax { float mn = 0.0f, mx = 0.0f; };
+
+        float  heights[kGridN * kGridN]         = {};
+        // hiz[level] has (kGridN >> level)² valid entries; rest over-allocated for simplicity.
+        MinMax hiz[kMips][kGridN * kGridN]      = {};
+        float  globalMin                        = 0.0f;
+        float  globalMax                        = 0.0f;
+
+        // Build min/max pyramid from current heights[].
+        void BuildPyramid();
+
+        // Bilinearly interpolated height at any world position (tiles automatically).
+        float Sample(float worldX, float worldZ, float tileSize) const;
+
+        // Conservative min/max height within an XZ world-space bounding box.
+        // Picks the finest pyramid level where the footprint fits in ≤ 9 cells.
+        std::pair<float, float> QueryRange(
+            float x0, float z0, float x1, float z1, float tileSize) const;
+    };
+
     FFTWaterSurface() = default;
 
     void Init(ID3D12Device* device, const WaterDesc& desc);
+
+    // Rebuild the base mesh if tweaks.meshResolution changed since last build.
+    // Call between WaitForFrame and BeginFrame to ensure no GPU work is in flight.
+    void RebuildMeshIfNeeded();
 
     const WaterDesc& GetDesc() const { return m_desc; }
 
@@ -49,6 +89,17 @@ public:
 
     // time: elapsed seconds since app start, used to animate the spectrum.
     void Update(CommandContext& ctx, LinearAllocator& alloc, float time);
+
+    // CPU-side height evaluation using only the lowest `modes` frequency bins per axis.
+    // Matches the GPU simulation exactly for those modes (same noise, same dispersion).
+    // elapsedTime must be the same value passed to Update().
+    // Naturally handles tiling — worldX/worldZ can be any value.
+    float SampleHeightCPU(float worldX, float worldZ, float elapsedTime, int modes = 4) const;
+
+    // Populate the CpuHeightfield cache for the current frame.
+    // Call once per frame before any Sample/QueryRange calls.
+    void BuildHeightfield(float elapsedTime, int modes = 4);
+    const CpuHeightfield& GetHeightfield() const { return m_heightfield; }
 
     // lightDir: world-space direction toward the light source.
     void Render(GraphicsContext& ctx, LinearAllocator& alloc, const View& view,
@@ -74,7 +125,9 @@ private:
         DirectX::XMFLOAT3   Color;
         float                TileSize;
         float                RcpTileSize;
-        float                _pad[3];
+        float                MaxTessellation;
+        float                TessDistance;
+        float                _pad;
     };
 
     // Matches WaterCommon.hlsli FrameConstants
@@ -115,8 +168,11 @@ private:
     ComPtr<ID3D12PipelineState> IFFTVerticalStepPSO;
     ComPtr<ID3D12PipelineState> PermutePSO;
 
-    // Graphics PSO (water surface rendering)
+    // Graphics PSOs — tessellated (HS+DS) and flat (VS-only) variants
     ComPtr<ID3D12PipelineState> WaterRenderPSO;
+    ComPtr<ID3D12PipelineState> WaterWireframePSO;
+    ComPtr<ID3D12PipelineState> WaterFlatPSO;
+    ComPtr<ID3D12PipelineState> WaterFlatWireframePSO;
 
     // GPU textures — all as PixelBuffer for state-tracked barrier management
     PixelBuffer m_noise;         // R32G32_FLOAT   NxN  SRV (Gaussian noise, SRV-only)
@@ -134,16 +190,24 @@ private:
     ComPtr<ID3D12Resource>      m_noiseUpload;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_noiseFootprint = {};
 
+    // CPU mirror of the noise texture — N×N Gaussian pairs, row-major.
+    std::vector<DirectX::XMFLOAT2> m_noiseCpu;
+
+    CpuHeightfield m_heightfield;
+
     // Environment cube map (reflection).
     ComPtr<ID3D12Resource>      m_envCubeMap;
     ComPtr<ID3D12Resource>      m_envCubeUpload;  // kept alive until GPU upload finishes
 
     // Water surface mesh
     VertexBuffer m_meshVertex;
-    IndexBuffer  m_meshIndex;
-    uint32_t     m_indexCount = 0;
+    IndexBuffer  m_meshIndex;       // 4-index quad patches (tessellated path)
+    IndexBuffer  m_meshIndexFlat;   // triangle list (non-tessellated path)
+    uint32_t     m_indexCount     = 0;
+    uint32_t     m_indexCountFlat = 0;
 
-    bool m_precomputeDone = false;
+    bool m_precomputeDone    = false;
+    int  m_lastMeshResolution = 0;
 
     // Heap slot indices for pre-built descriptor tables.
     enum : UINT
