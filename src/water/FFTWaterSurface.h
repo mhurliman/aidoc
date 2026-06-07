@@ -37,7 +37,7 @@ public:
         float timeScale       = 0.5f;   // slows or speeds up wave animation
         float maxTessellation = 32.0f;  // peak tessellation factor near camera
         float tessDistance    = 30.0f;  // distance (m) at which tessellation reaches 1
-        DirectX::XMFLOAT3 color = { 0.05f, 0.3f, 0.5f };
+        DirectX::XMFLOAT3 color = { 0.082f, 0.105f, 0.356f };
         bool  visible         = true;
         bool  wireframe       = false;
         int   tileCount       = 3;      // tiles per side; 1=single, 3=3×3 grid, etc.
@@ -76,7 +76,7 @@ public:
 
     FFTWaterSurface() = default;
 
-    void Init(ID3D12Device* device, const WaterDesc& desc);
+    void Init(ID3D12Device* device, const WaterDesc& desc, ID3D12CommandQueue* queue);
 
     // Rebuild the base mesh if tweaks.meshResolution changed since last build.
     // Call between WaitForFrame and BeginFrame to ensure no GPU work is in flight.
@@ -86,6 +86,11 @@ public:
 
     // Load six cube-map face images (px,nx,py,ny,pz,nz order) into the reflection slot.
     void LoadEnvironmentMap(ID3D12CommandQueue* queue, const std::string facePaths[6]);
+
+    // Override the reflection cubemap with a live resource (e.g., the atmosphere env cubemap).
+    // Creates a TextureCube SRV directly into the render descriptor table.
+    // Call once after Init(); the resource must remain valid for the lifetime of the surface.
+    void SetEnvCubemapFromResource(ID3D12Device* device, ID3D12Resource* resource);
 
     // time: elapsed seconds since app start, used to animate the spectrum.
     void Update(CommandContext& ctx, LinearAllocator& alloc, float time);
@@ -100,6 +105,10 @@ public:
     // Call once per frame before any Sample/QueryRange calls.
     void BuildHeightfield(float elapsedTime, int modes = 4);
     const CpuHeightfield& GetHeightfield() const { return m_heightfield; }
+
+    // Radially-averaged |h0(k)| spectrum, indexed by integer grid radius 0..N/2.
+    // Rebuilt automatically whenever Phillips parameters change.
+    const std::vector<float>& GetSpectrumPlot() const { return m_spectrumPlot; }
 
     // lightDir: world-space direction toward the light source.
     void Render(GraphicsContext& ctx, LinearAllocator& alloc, const View& view,
@@ -145,6 +154,7 @@ private:
     void BuildDescriptorTables();
     void CreateMesh();
     void GenerateNoise();
+    void UploadNoiseSync(ID3D12CommandQueue* queue);
 
     D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle(UINT slot) const;
     D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT slot) const;
@@ -206,8 +216,23 @@ private:
     uint32_t     m_indexCount     = 0;
     uint32_t     m_indexCountFlat = 0;
 
-    bool m_precomputeDone    = false;
-    int  m_lastMeshResolution = 0;
+    struct PhillipsParams
+    {
+        float windTheta, windSpeed, smallWaveCutoff, amplitude;
+        bool operator==(const PhillipsParams& o) const
+        {
+            return windTheta == o.windTheta && windSpeed == o.windSpeed
+                && smallWaveCutoff == o.smallWaveCutoff && amplitude == o.amplitude;
+        }
+    };
+
+    bool           m_precomputeDone     = false;  // twiddle factors only
+    PhillipsParams m_lastPhillipsParams = {};     // zero — guaranteed != any real tweaks
+    bool           m_phillipsValid      = false;
+    int            m_lastMeshResolution = 0;
+
+    std::vector<float> m_spectrumPlot;  // size N/2+1; rebuilt when Phillips params change
+    void BuildSpectrumPlot();
 
     // Heap slot indices for pre-built descriptor tables.
     enum : UINT

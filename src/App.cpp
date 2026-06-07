@@ -144,17 +144,26 @@ void App::LoadScene()
     WaterDesc waterDesc = {};
     waterDesc.N = waterDesc.M = 256;
     waterDesc.TileSize = 10.0f;
-    m_scene.CreateWater(m_device.Get(), waterDesc);
+    m_scene.CreateWater(m_device.Get(), waterDesc, m_commandQueue.Get());
 
-    const std::string envFaces[6] = {
-        ResolveExePath("textures/TropicalSunnyDay_px.jpg"),
-        ResolveExePath("textures/TropicalSunnyDay_nx.jpg"),
-        ResolveExePath("textures/TropicalSunnyDay_py.jpg"),
-        ResolveExePath("textures/TropicalSunnyDay_ny.jpg"),
-        ResolveExePath("textures/TropicalSunnyDay_pz.jpg"),
-        ResolveExePath("textures/TropicalSunnyDay_nz.jpg"),
-    };
-    m_scene.GetWaterSurface().LoadEnvironmentMap(m_commandQueue.Get(), envFaces);
+    m_scene.CreateAtmosphere(m_device.Get());
+
+    // Prime the directional light direction from the initial GUI sun angles so that
+    // frame 0 uses the same direction the sliders show rather than whatever came from JSON.
+    if (!m_scene.GetDirectionalLights().empty())
+    {
+        float elevRad = m_sunElevation * 3.14159265f / 180.0f;
+        float azimRad = m_sunAzimuth   * 3.14159265f / 180.0f;
+        auto& dir = m_scene.GetDirectionalLights()[0].direction;
+        dir.x = -cosf(elevRad) * sinf(azimRad);
+        dir.y = -sinf(elevRad);
+        dir.z = -cosf(elevRad) * cosf(azimRad);
+    }
+
+    // Wire the atmosphere env cubemap into the water reflection slot.
+    // This replaces the static JPG cubemap; the atmosphere updates it every frame.
+    m_scene.GetWaterSurface().SetEnvCubemapFromResource(
+        m_device.Get(), m_scene.GetAtmosphere().GetEnvCubeResource());
 }
 
 void App::InitImGui(HWND hwnd)
@@ -281,6 +290,10 @@ void App::Render()
 {
     WaitForFrame(m_frameIndex);
 
+    // Mesh rebuild releases the old vertex/index buffers — must wait for all frame slots,
+    // not just this one, since FrameCount=3 means two other slots may still be in flight.
+    if (m_scene.GetWaterSurface().tweaks.meshResolution != m_scene.GetWaterSurface().GetDesc().MeshResolution)
+        WaitForGpu();
     m_scene.GetWaterSurface().RebuildMeshIfNeeded();
 
     auto& rt = m_displayBuffers[m_frameIndex];
@@ -420,7 +433,71 @@ void App::Render()
         ImGui::SliderFloat("Max Tess",          &tweaks.maxTessellation, 1.0f,  64.0f);
         ImGui::SliderFloat("Tess Distance",     &tweaks.tessDistance,    5.0f, 200.0f);
         ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
+
+        const auto& specPlot = water.GetSpectrumPlot();
+        if (!specPlot.empty())
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Wave Spectrum  (|k| = 0..N/2,  total |h0| per ring)");
+            ImGui::PlotLines("##spectrum", specPlot.data(), (int)specPlot.size(),
+                             0, nullptr, 0.0f, FLT_MAX, ImVec2(-1, 80));
+        }
+
         ImGui::TextDisabled("FFT: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Atmosphere", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        auto& atm = m_scene.GetAtmosphere();
+        auto& ap  = atm.params;
+        ImGui::Checkbox("Visible##atm", &atm.visible);
+
+        if (ImGui::TreeNode("Sun"))
+        {
+            // Drive the first directional light's direction from elevation/azimuth.
+            bool changed = false;
+            changed |= ImGui::SliderFloat("Elevation (deg)", &m_sunElevation, -10.0f, 90.0f);
+            changed |= ImGui::SliderFloat("Azimuth (deg)",   &m_sunAzimuth,    0.0f, 360.0f);
+            ImGui::SliderFloat("Intensity", &ap.sunIntensity, 1.0f, 50.0f);
+
+            if (changed && !m_scene.GetDirectionalLights().empty())
+            {
+                float elevRad = m_sunElevation * 3.14159265f / 180.0f;
+                float azimRad = m_sunAzimuth   * 3.14159265f / 180.0f;
+                // Direction light travels (toward scene): opposite of "toward sun"
+                auto& dir = m_scene.GetDirectionalLights()[0].direction;
+                dir.x = -cosf(elevRad) * sinf(azimRad);
+                dir.y = -sinf(elevRad);
+                dir.z = -cosf(elevRad) * cosf(azimRad);
+            }
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Rayleigh"))
+        {
+            ImGui::SliderFloat3("Beta (km^-1)", &ap.rayleighBeta.x, 0.0f, 0.1f, "%.5f");
+            ImGui::SliderFloat("Scale Height (km)", &ap.rayleighScaleHeight, 1.0f, 20.0f);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Mie"))
+        {
+            ImGui::SliderFloat("Beta (km^-1)",    &ap.mieBeta.x,      0.0f, 0.1f, "%.4f");
+            ap.mieBeta.y = ap.mieBeta.z = ap.mieBeta.x;
+            ap.mieBetaExt.x = ap.mieBetaExt.y = ap.mieBetaExt.z = ap.mieBeta.x * 1.1f;
+            ImGui::SliderFloat("Scale Height (km)", &ap.mieScaleHeight, 0.1f, 5.0f);
+            ImGui::SliderFloat("G (asymmetry)",  &ap.mieG,           0.0f, 0.999f);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Ozone"))
+        {
+            ImGui::SliderFloat3("Beta Abs (km^-1)",   &ap.ozoneBetaAbs.x,      0.0f, 0.005f, "%.5f");
+            ImGui::SliderFloat("Center Height (km)", &ap.ozoneCenterHeight, 10.0f, 40.0f);
+            ImGui::SliderFloat("Width (km)",          &ap.ozoneWidth,         5.0f, 30.0f);
+            ImGui::TreePop();
+        }
+        if (ImGui::Button("Recompute Transmittance LUT"))
+            atm.MarkDirty();
     }
 
     ImGui::End();

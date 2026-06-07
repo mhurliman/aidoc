@@ -72,7 +72,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE FFTWaterSurface::CpuHandle(UINT slot) const
 // Init
 // ---------------------------------------------------------------------------
 
-void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc)
+void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc, ID3D12CommandQueue* queue)
 {
     m_device = device;
     m_desc   = desc;
@@ -92,6 +92,54 @@ void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc)
     CreateMesh();
     m_lastMeshResolution = desc.MeshResolution;
     GenerateNoise();
+    UploadNoiseSync(queue);
+}
+
+void FFTWaterSurface::UploadNoiseSync(ID3D12CommandQueue* queue)
+{
+    ComPtr<ID3D12CommandAllocator>    tempAlloc;
+    ComPtr<ID3D12GraphicsCommandList> tempCmd;
+    ASSERT_SUCCEEDED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(&tempAlloc)));
+    ASSERT_SUCCEEDED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        tempAlloc.Get(), nullptr, IID_PPV_ARGS(&tempCmd)));
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource       = m_noiseUpload.Get();
+    src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = m_noiseFootprint;
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource        = m_noise.GetResource();
+    dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    tempCmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource   = m_noise.GetResource();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    tempCmd->ResourceBarrier(1, &barrier);
+    tempCmd->Close();
+
+    ID3D12CommandList* lists[] = { tempCmd.Get() };
+    queue->ExecuteCommandLists(1, lists);
+
+    ComPtr<ID3D12Fence> fence;
+    ASSERT_SUCCEEDED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+    HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    ASSERT_SUCCEEDED(queue->Signal(fence.Get(), 1));
+    if (fence->GetCompletedValue() < 1)
+    {
+        fence->SetEventOnCompletion(1, ev);
+        WaitForSingleObject(ev, INFINITE);
+    }
+    CloseHandle(ev);
+
+    m_noise.SetCurrentState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +250,7 @@ void FFTWaterSurface::CreateTextures()
     // Noise: SRV-only, data arrives via CopyTextureRegion on first Update.
     m_noise.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N,
                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    m_noise.SetDebugName(L"Water/Noise");
 
     m_h0.Create        (m_device, DXGI_FORMAT_R32G32B32A32_FLOAT, N, N, kUAV, kUAVState);
     m_heightFreq.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
@@ -209,13 +258,23 @@ void FFTWaterSurface::CreateTextures()
     m_dispFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
     m_pingpong[0].Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
     m_pingpong[1].Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
+    m_h0.SetDebugName        (L"Water/H0Spectrum");
+    m_heightFreq.SetDebugName(L"Water/HeightFreq");
+    m_gradFreq.SetDebugName  (L"Water/GradFreq");
+    m_dispFreq.SetDebugName  (L"Water/DispFreq");
+    m_pingpong[0].SetDebugName(L"Water/PingPong0");
+    m_pingpong[1].SetDebugName(L"Water/PingPong1");
 
     // Twiddle factor table: log2N columns, N rows.
     m_precomputed.Create(m_device, DXGI_FORMAT_R32G32B32A32_FLOAT, m_log2N, N, kUAV, kUAVState);
+    m_precomputed.SetDebugName(L"Water/TwiddleFactors");
 
     m_heightMap.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
     m_gradMap.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
     m_dispMap.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+    m_heightMap.SetDebugName(L"Water/HeightMap");
+    m_gradMap.SetDebugName  (L"Water/GradientMap");
+    m_dispMap.SetDebugName  (L"Water/DisplacementMap");
 }
 
 // ---------------------------------------------------------------------------
@@ -282,66 +341,41 @@ static void CreateNullUAV(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE dest
 
 void FFTWaterSurface::BuildDescriptorTables()
 {
-    // Individual resource descriptors
-    CreateSRV2D(m_device, m_noise,       CpuHandle(kNoiseSRV));
-    CreateSRV2D(m_device, m_h0,          CpuHandle(kH0SRV));
-    CreateSRV2D(m_device, m_heightFreq,  CpuHandle(kHeightFreqSRV));
-    CreateSRV2D(m_device, m_gradFreq,    CpuHandle(kGradFreqSRV));
-    CreateSRV2D(m_device, m_dispFreq,    CpuHandle(kDispFreqSRV));
-    CreateSRV2D(m_device, m_pingpong[0], CpuHandle(kPP0SRV));
-    CreateSRV2D(m_device, m_pingpong[1], CpuHandle(kPP1SRV));
-    CreateSRV2D(m_device, m_precomputed, CpuHandle(kPrecompSRV));
-    CreateSRV2D(m_device, m_heightMap,   CpuHandle(kHeightMapSRV));
-    CreateSRV2D(m_device, m_gradMap,     CpuHandle(kGradMapSRV));
-    CreateSRV2D(m_device, m_dispMap,     CpuHandle(kDispMapSRV));
-    CreateNullSRV(m_device, CpuHandle(kNullSRV));
+    // All descriptors are created directly at their final heap slots — no CopyDescriptorsSimple
+    // from shader-visible heap, which is CPU write-only and cannot be used as a copy source.
 
-    CreateNullUAV(m_device, CpuHandle(kNullUAV));
-    CreateUAV2D(m_device, m_h0,          CpuHandle(kH0UAV));
-    CreateUAV2D(m_device, m_heightFreq,  CpuHandle(kHeightFreqUAV));
-    CreateUAV2D(m_device, m_gradFreq,    CpuHandle(kGradFreqUAV));
-    CreateUAV2D(m_device, m_dispFreq,    CpuHandle(kDispFreqUAV));
-    CreateUAV2D(m_device, m_pingpong[0], CpuHandle(kPP0UAV));
-    CreateUAV2D(m_device, m_pingpong[1], CpuHandle(kPP1UAV));
-    CreateUAV2D(m_device, m_precomputed, CpuHandle(kPrecompUAV));
-    CreateUAV2D(m_device, m_heightMap,   CpuHandle(kHeightMapUAV));
-    CreateUAV2D(m_device, m_gradMap,     CpuHandle(kGradMapUAV));
-    CreateUAV2D(m_device, m_dispMap,     CpuHandle(kDispMapUAV));
-
-    auto fillComputeTable = [&](UINT base,
-                                 UINT s0, UINT s1, UINT s2,
-                                 UINT u0, UINT u1, UINT u2)
+    auto S = [&](PixelBuffer* buf, UINT slot) {
+        if (buf) CreateSRV2D(m_device, *buf, CpuHandle(slot));
+        else     CreateNullSRV(m_device, CpuHandle(slot));
+    };
+    auto U = [&](PixelBuffer* buf, UINT slot) {
+        if (buf) CreateUAV2D(m_device, *buf, CpuHandle(slot));
+        else     CreateNullUAV(m_device, CpuHandle(slot));
+    };
+    auto fillTable = [&](UINT base,
+                          PixelBuffer* s0, PixelBuffer* s1, PixelBuffer* s2,
+                          PixelBuffer* u0, PixelBuffer* u1, PixelBuffer* u2)
     {
-        UINT srvs[] = { s0, s1, s2 };
-        UINT uavs[] = { u0, u1, u2 };
-        for (UINT i = 0; i < 3; ++i)
-            m_device->CopyDescriptorsSimple(1, CpuHandle(base + i),
-                                            CpuHandle(srvs[i]),
-                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        for (UINT i = 0; i < 3; ++i)
-            m_device->CopyDescriptorsSimple(1, CpuHandle(base + 3 + i),
-                                            CpuHandle(uavs[i]),
-                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        S(s0, base + 0); S(s1, base + 1); S(s2, base + 2);
+        U(u0, base + 3); U(u1, base + 4); U(u2, base + 5);
     };
 
-    fillComputeTable(kPhillipsTable,   kNoiseSRV,      kNullSRV, kNullSRV, kH0UAV,        kNullUAV, kNullUAV);
-    fillComputeTable(kDynSpecTable,    kH0SRV,         kNullSRV, kNullSRV, kHeightFreqUAV, kGradFreqUAV, kDispFreqUAV);
-    fillComputeTable(kPrecomputeTable, kNullSRV,       kNullSRV, kNullSRV, kPrecompUAV,   kNullUAV, kNullUAV);
-    fillComputeTable(kInitHeightTable, kPrecompSRV,    kHeightFreqSRV, kNullSRV, kPP0UAV, kNullUAV, kNullUAV);
-    fillComputeTable(kInitGradTable,   kPrecompSRV,    kGradFreqSRV,   kNullSRV, kPP0UAV, kNullUAV, kNullUAV);
-    fillComputeTable(kInitDispTable,   kPrecompSRV,    kDispFreqSRV,   kNullSRV, kPP0UAV, kNullUAV, kNullUAV);
-    fillComputeTable(kIFFT0to1Table,   kPrecompSRV,    kPP0SRV,  kNullSRV, kPP1UAV,       kNullUAV, kNullUAV);
-    fillComputeTable(kIFFT1to0Table,   kPrecompSRV,    kPP1SRV,  kNullSRV, kPP0UAV,       kNullUAV, kNullUAV);
-    fillComputeTable(kPermuteHTable,   kPP1SRV,        kNullSRV, kNullSRV, kHeightMapUAV, kNullUAV, kNullUAV);
-    fillComputeTable(kPermuteGTable,   kPP1SRV,        kNullSRV, kNullSRV, kGradMapUAV,   kNullUAV, kNullUAV);
-    fillComputeTable(kPermuteDTable,   kPP1SRV,        kNullSRV, kNullSRV, kDispMapUAV,   kNullUAV, kNullUAV);
+    fillTable(kPhillipsTable,   &m_noise,       nullptr,        nullptr, &m_h0,         nullptr,       nullptr);
+    fillTable(kDynSpecTable,    &m_h0,          nullptr,        nullptr, &m_heightFreq, &m_gradFreq,   &m_dispFreq);
+    fillTable(kPrecomputeTable, nullptr,        nullptr,        nullptr, &m_precomputed, nullptr,      nullptr);
+    fillTable(kInitHeightTable, &m_precomputed, &m_heightFreq,  nullptr, &m_pingpong[0], nullptr,      nullptr);
+    fillTable(kInitGradTable,   &m_precomputed, &m_gradFreq,    nullptr, &m_pingpong[0], nullptr,      nullptr);
+    fillTable(kInitDispTable,   &m_precomputed, &m_dispFreq,    nullptr, &m_pingpong[0], nullptr,      nullptr);
+    fillTable(kIFFT0to1Table,   &m_precomputed, &m_pingpong[0], nullptr, &m_pingpong[1], nullptr,      nullptr);
+    fillTable(kIFFT1to0Table,   &m_precomputed, &m_pingpong[1], nullptr, &m_pingpong[0], nullptr,      nullptr);
+    fillTable(kPermuteHTable,   &m_pingpong[1], nullptr,        nullptr, &m_heightMap,   nullptr,      nullptr);
+    fillTable(kPermuteGTable,   &m_pingpong[1], nullptr,        nullptr, &m_gradMap,     nullptr,      nullptr);
+    fillTable(kPermuteDTable,   &m_pingpong[1], nullptr,        nullptr, &m_dispMap,     nullptr,      nullptr);
 
-    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderTable + 0), CpuHandle(kHeightMapSRV),
-                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderTable + 1), CpuHandle(kGradMapSRV),
-                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderTable + 2), CpuHandle(kDispMapSRV),
-                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // Render table: height/grad/disp SRVs + two per-frame slots (filled in Render()) + env cube.
+    S(&m_heightMap, kRenderTable + 0);
+    S(&m_gradMap,   kRenderTable + 1);
+    S(&m_dispMap,   kRenderTable + 2);
     CreateNullSRV    (m_device, CpuHandle(kRenderTable + 3));
     CreateNullSRV    (m_device, CpuHandle(kRenderTable + 4));
     CreateNullSRVCube(m_device, CpuHandle(kRenderTable + 5));
@@ -598,6 +632,77 @@ void FFTWaterSurface::LoadEnvironmentMap(ID3D12CommandQueue* queue, const std::s
                                        CpuHandle(kRenderTable + 5));
 }
 
+void FFTWaterSurface::SetEnvCubemapFromResource(ID3D12Device* device, ID3D12Resource* resource)
+{
+    // Retrieve the format from the resource desc so we don't need to hard-code it.
+    D3D12_RESOURCE_DESC rdesc = resource->GetDesc();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format                  = rdesc.Format;
+    srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.TextureCube.MipLevels   = 1;
+    device->CreateShaderResourceView(resource, &srvDesc, CpuHandle(kRenderTable + 5));
+}
+
+// ---------------------------------------------------------------------------
+// Spectral plot — radial power distribution for ImGui visualization
+// ---------------------------------------------------------------------------
+
+void FFTWaterSurface::BuildSpectrumPlot()
+{
+    if (m_noiseCpu.empty())
+        return;
+
+    const float Pi    = 3.14159265f;
+    const float g     = 9.81f;
+    const int   N     = m_desc.N;
+    const int   halfN = N / 2;
+    const float DeltaK = 2.0f * Pi / m_desc.TileSize;
+    const float L        = tweaks.windSpeed * tweaks.windSpeed / g;
+    const float windCosT = cosf(tweaks.windTheta);
+    const float windSinT = sinf(tweaks.windTheta);
+
+    auto phillips = [&](float kx, float kz) -> float
+    {
+        float k2 = kx * kx + kz * kz;
+        if (k2 < 1e-8f) return 0.0f;
+        float kLen = sqrtf(k2);
+        float kL2  = k2 * L * L;
+        float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
+        float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
+        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+    };
+
+    const int binCount = halfN + 1;
+    std::vector<float> sumH0(binCount, 0.0f);
+
+    for (int nz = -halfN; nz < halfN; ++nz)
+    {
+        for (int nx = -halfN; nx < halfN; ++nx)
+        {
+            if (nx == 0 && nz == 0) continue;
+
+            int bin = (int)roundf(sqrtf((float)(nx * nx + nz * nz)));
+            if (bin <= 0 || bin >= binCount) continue;
+
+            float kx = nx * DeltaK;
+            float kz = nz * DeltaK;
+
+            int tx = ((nx + halfN) % N + N) % N;
+            int tz = ((nz + halfN) % N + N) % N;
+
+            const auto& noise = m_noiseCpu[tz * N + tx];
+            float phiK = sqrtf(phillips(kx, kz) * 0.5f);
+            float h0R  = noise.x * phiK;
+            float h0I  = noise.y * phiK;
+            sumH0[bin] += sqrtf(h0R * h0R + h0I * h0I);
+        }
+    }
+
+    m_spectrumPlot = std::move(sumH0);
+}
+
 // ---------------------------------------------------------------------------
 // CPU height sampling (low-frequency Tessendorf sum)
 // ---------------------------------------------------------------------------
@@ -805,25 +910,16 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
 
     ctx.SetDescriptorHeap(m_heap.Get());
 
-    // ---- One-time precomputation on first frame ----
-    //if (!m_precomputeDone)
+    // ---- Phillips spectrum — re-run whenever spectral parameters change ----
+    // Noise is already in NON_PIXEL_SHADER_RESOURCE state (uploaded synchronously in Init).
     {
-        // Upload noise data then transition to shader-readable state.
-        D3D12_TEXTURE_COPY_LOCATION src = {};
-        src.pResource       = m_noiseUpload.Get();
-        src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint = m_noiseFootprint;
-
-        D3D12_TEXTURE_COPY_LOCATION dst = {};
-        dst.pResource        = m_noise.GetResource();
-        dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
-
-        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        ctx.TransitionResource(m_noise, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-        // Phillips spectrum (once)
+        PhillipsParams currentParams = { tweaks.windTheta, tweaks.windSpeed,
+                                         tweaks.smallWaveCutoff, tweaks.amplitude };
+        if (!m_phillipsValid || !(currentParams == m_lastPhillipsParams))
         {
+            // h0 starts as UAV on first frame; on re-runs it's NPSR — transition back to UAV.
+            ctx.TransitionResource(m_h0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
             struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude; };
             auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
             FFTParameters fftParams = { (uint32_t)N, m_desc.TileSize, 1.0f / m_desc.TileSize };
@@ -838,32 +934,37 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
             ctx.SetPipelineState(PhillipsSpectrumPSO.Get());
             cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
             cmd->SetComputeRootConstantBufferView(1, globAlloc.gpuAddress);
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(kPhillipsTable));
             ctx.FlushResourceBarriers();
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle(kPhillipsTable));
             cmd->Dispatch(groupsN, groupsN, 1);
 
             ctx.UAVBarrier(m_h0);
-            // H0 stays NON_PIXEL_SHADER_RESOURCE permanently after this.
             ctx.TransitionResource(m_h0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            m_lastPhillipsParams = currentParams;
+            m_phillipsValid      = true;
+            BuildSpectrumPlot();
         }
+    }
 
-        // Precompute twiddle factors (once)
-        {
-            auto fftAlloc   = alloc.Allocate(sizeof(FFTParameters));
-            FFTParameters fftParams = { (uint32_t)N, m_desc.TileSize, 1.0f / m_desc.TileSize };
-            memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
-            auto dummyAlloc = alloc.Allocate(256);
+    // ---- Twiddle factors — one-time precomputation (depends only on N) ----
+    if (!m_precomputeDone)
+    {
+        auto fftAlloc   = alloc.Allocate(sizeof(FFTParameters));
+        FFTParameters fftParams = { (uint32_t)N, m_desc.TileSize, 1.0f / m_desc.TileSize };
+        memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
+        auto dummyAlloc = alloc.Allocate(256);
 
-            ctx.SetPipelineState(PrecomputePSO.Get());
-            cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
-            cmd->SetComputeRootConstantBufferView(1, dummyAlloc.gpuAddress);
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(kPrecomputeTable));
-            ctx.FlushResourceBarriers();
-            cmd->Dispatch((UINT)m_log2N, groupsN / 2, 1);
+        cmd->SetComputeRootSignature(m_computeRootSig.Get());
+        ctx.SetPipelineState(PrecomputePSO.Get());
+        cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
+        cmd->SetComputeRootConstantBufferView(1, dummyAlloc.gpuAddress);
+        ctx.FlushResourceBarriers();
+        cmd->SetComputeRootDescriptorTable(2, GpuHandle(kPrecomputeTable));
+        cmd->Dispatch((UINT)m_log2N, groupsN / 2, 1);
 
-            ctx.UAVBarrier(m_precomputed);
-            ctx.TransitionResource(m_precomputed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        }
+        ctx.UAVBarrier(m_precomputed);
+        ctx.TransitionResource(m_precomputed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
         m_precomputeDone = true;
     }
@@ -891,8 +992,8 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
         ctx.SetPipelineState(DynamicSpectrumPSO.Get());
         cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
         cmd->SetComputeRootConstantBufferView(1, timeAlloc.gpuAddress);
-        cmd->SetComputeRootDescriptorTable(2, GpuHandle(kDynSpecTable));
         ctx.FlushResourceBarriers();
+        cmd->SetComputeRootDescriptorTable(2, GpuHandle(kDynSpecTable));
         cmd->Dispatch(groupsN, groupsN, 1);
     }
 
@@ -926,8 +1027,8 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
             ctx.SetPipelineState(IFFTHorizonalStepPSO.Get());
             cmd->SetComputeRootConstantBufferView(0, globAlloc.gpuAddress);
             cmd->SetComputeRootConstantBufferView(1, dummyAlloc.gpuAddress);
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(tableBase));
             ctx.FlushResourceBarriers();
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle(tableBase));
             cmd->Dispatch(groupsN, groupsN, 1);
 
             ctx.UAVBarrier(m_pingpong[writeIdx]);
@@ -959,8 +1060,8 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
             ctx.SetPipelineState(IFFTVerticalStepPSO.Get());
             cmd->SetComputeRootConstantBufferView(0, globAlloc.gpuAddress);
             cmd->SetComputeRootConstantBufferView(1, dummyAlloc.gpuAddress);
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(tableBase));
             ctx.FlushResourceBarriers();
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle(tableBase));
             cmd->Dispatch(groupsN, groupsN, 1);
 
             ctx.UAVBarrier(m_pingpong[writeIdx]);
@@ -978,8 +1079,8 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
             ctx.SetPipelineState(PermutePSO.Get());
             cmd->SetComputeRootConstantBufferView(0, dummy0.gpuAddress);
             cmd->SetComputeRootConstantBufferView(1, dummy1.gpuAddress);
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(ch.permuteTable));
             ctx.FlushResourceBarriers();
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle(ch.permuteTable));
             cmd->Dispatch(groupsN, groupsN, 1);
             ctx.UAVBarrier(*ch.finalMap);
         }

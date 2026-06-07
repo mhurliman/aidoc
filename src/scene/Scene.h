@@ -13,6 +13,7 @@
 
 #include "Light.h"
 #include "water/FFTWaterSurface.h"
+#include "gfx/Atmosphere.h"
 
 class Mesh;
 class ResourceManager;
@@ -34,9 +35,11 @@ public:
     // Mesh paths in the JSON are resolved relative to the executable directory.
     void Load(const std::string& jsonPath, ID3D12Device* device, ResourceManager& resMgr);
 
-    void CreateWater(ID3D12Device* device, const WaterDesc& desc);
+    void CreateWater(ID3D12Device* device, const WaterDesc& desc, ID3D12CommandQueue* queue);
+    void CreateAtmosphere(ID3D12Device* device);
 
-    FFTWaterSurface& GetWaterSurface() { return m_water; }
+    FFTWaterSurface& GetWaterSurface()   { return m_water; }
+    Atmosphere&      GetAtmosphere()     { return m_atmosphere; }
     const FFTWaterSurface& GetWaterSurface() const { return m_water; }
     std::vector<Entity>&       GetEntities()       { return m_entities; }
     const std::vector<Entity>& GetEntities() const { return m_entities; }
@@ -55,4 +58,5 @@ private:
     std::vector<PointLight> m_pointLights;
     std::vector<SpotLight> m_spotLights;
     FFTWaterSurface m_water;
+    Atmosphere      m_atmosphere;
 };

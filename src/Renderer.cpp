@@ -150,25 +150,60 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         gpuLights.push_back(ToGpuLight(light));
     }
 
-    // Bind per-frame constants
+    // Allocate per-frame constants (bind after atmosphere — atmosphere changes the graphics
+    // root signature, and restoring it invalidates all graphics root arguments).
     FrameConstants fc = frameConstants;
     fc.numLights = static_cast<int>(gpuLights.size());
     auto frameAlloc = m_linearAllocator.Allocate(sizeof(FrameConstants));
     memcpy(frameAlloc.cpuAddress, &fc, sizeof(FrameConstants));
-    m_gfxContext.SetConstantBufferView(0, frameAlloc.gpuAddress);
 
-    // Bind lights structured buffer at root param 3
+    // Allocate lights buffer (may be empty).
+    LinearAllocator::Allocation lightsAlloc = {};
     if (!gpuLights.empty())
     {
         size_t lightsSize = gpuLights.size() * sizeof(GpuLight);
-        auto lightsAlloc = m_linearAllocator.Allocate(lightsSize);
+        lightsAlloc = m_linearAllocator.Allocate(lightsSize);
         memcpy(lightsAlloc.cpuAddress, gpuLights.data(), lightsSize);
-        m_gfxContext.SetShaderResourceView(3, lightsAlloc.gpuAddress);
     }
+
+    auto* cmd = m_gfxContext.GetCommandList();
+
+    // Atmosphere: compute LUTs then render sky as background before opaque geometry.
+    auto& atm = scene.GetAtmosphere();
+    if (atm.visible)
+    {
+        DirectX::XMFLOAT3 sunDir = { -0.3f, -1.0f, 0.5f };
+        if (!scene.GetDirectionalLights().empty())
+            sunDir = scene.GetDirectionalLights()[0].direction;
+        // Flip to "toward sun" convention and normalize (unnormalized direction causes
+        // mu_s > 1 in the Mie phase function, producing NaN via pow(negative, 1.5)).
+        DirectX::XMVECTOR sdv = DirectX::XMVector3Normalize(
+            DirectX::XMVectorSet(-sunDir.x, -sunDir.y, -sunDir.z, 0.0f));
+        DirectX::XMFLOAT3 sunDirToward;
+        DirectX::XMStoreFloat3(&sunDirToward, sdv);
+
+        m_profiler.BeginScope("Atmosphere LUT", cmd);
+        atm.Update(m_gfxContext, m_linearAllocator, sunDirToward, view.position.y);
+        m_profiler.EndScope(cmd);
+
+        m_profiler.BeginScope("Sky Render", cmd);
+        // Restore renderer RTV before sky render
+        m_gfxContext.SetRenderTarget(*m_currentRT, *m_currentDS);
+        atm.Render(m_gfxContext, m_linearAllocator, view);
+        m_profiler.EndScope(cmd);
+
+        // Restore renderer state after atmosphere took over descriptor heap and root sig.
+        m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
+        m_gfxContext.SetRootSignature(m_rootSignature.Get());
+    }
+
+    // Bind per-frame root args now that the root signature is stable.
+    m_gfxContext.SetConstantBufferView(0, frameAlloc.gpuAddress);
+    if (!gpuLights.empty())
+        m_gfxContext.SetShaderResourceView(3, lightsAlloc.gpuAddress);
 
     m_gfxContext.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    auto* cmd = m_gfxContext.GetCommandList();
     m_profiler.BeginScope("Opaque Meshes", cmd);
     for (const auto& entity : scene.GetEntities())
     {
@@ -218,6 +253,7 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         m_profiler.BeginScope("Water Render", cmd);
         m_gfxContext.TransitionResource(*m_currentDS,
             D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_gfxContext.FlushResourceBarriers();
 
         water.Render(m_gfxContext, m_linearAllocator, view, lightDir,
                      m_currentDS->GetSRV(), m_sceneColorSRVHandle);

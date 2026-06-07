@@ -153,7 +153,12 @@ void Scene::Load(const std::string& jsonPath, ID3D12Device* device, ResourceMana
     }
 }
 
-void Scene::CreateWater(ID3D12Device* device, const WaterDesc& desc)
+void Scene::CreateWater(ID3D12Device* device, const WaterDesc& desc, ID3D12CommandQueue* queue)
 {
-    m_water.Init(device, desc);
+    m_water.Init(device, desc, queue);
+}
+
+void Scene::CreateAtmosphere(ID3D12Device* device)
+{
+    m_atmosphere.Init(device);
 }

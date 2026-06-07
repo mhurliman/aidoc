@@ -23,6 +23,8 @@ public:
     D3D12_RESOURCE_STATES GetCurrentState() const { return m_currentState; }
     void SetCurrentState(D3D12_RESOURCE_STATES state) { m_currentState = state; }
 
+    void SetDebugName(const wchar_t* name) { if (m_resource) m_resource->SetName(name); }
+
 protected:
     ComPtr<ID3D12Resource> m_resource;
     D3D12_RESOURCE_STATES m_currentState = D3D12_RESOURCE_STATE_COMMON;

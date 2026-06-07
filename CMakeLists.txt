@@ -45,6 +45,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/scene/Scene.cpp
     src/assets/ResourceManager.cpp
     src/water/FFTWaterSurface.cpp
+    src/gfx/Atmosphere.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -236,6 +237,76 @@ add_custom_command(
     VERBATIM
 )
 list(APPEND SHADER_OUTPUTS ${WATER_PS_OUTPUT})
+
+# Atmosphere shaders
+set(ATM_COMMON_INC "${CMAKE_SOURCE_DIR}/shaders/Atmosphere/AtmosphereCommon.hlsli")
+
+set(ATM_SHADERS
+    "Atmosphere/AtmosphereComputeRootSig.hlsl|atm_compute_rs|rootsig_1_1|ROOTSIG"
+    "Atmosphere/AtmosphereRenderRootSig.hlsl|atm_render_rs|rootsig_1_1|ROOTSIG"
+    "Atmosphere/AtmEnvCubemapRootSig.hlsl|atm_envcube_rs|rootsig_1_1|ROOTSIG"
+)
+foreach(RS_ENTRY ${ATM_SHADERS})
+    string(REPLACE "|" ";" RS_PARTS "${RS_ENTRY}")
+    list(GET RS_PARTS 0 RS_REL)
+    list(GET RS_PARTS 1 RS_NAME)
+    list(GET RS_PARTS 2 RS_PROFILE)
+    list(GET RS_PARTS 3 RS_EP)
+    set(RS_FILE "${CMAKE_SOURCE_DIR}/shaders/${RS_REL}")
+    set(RS_OUT  "${SHADER_OUTPUT_DIR}/${RS_NAME}.cso")
+    add_custom_command(
+        OUTPUT ${RS_OUT}
+        COMMAND ${DXC_EXECUTABLE} -T ${RS_PROFILE} -E ${RS_EP} ${DXC_SHADER_FLAGS} -Fo ${RS_OUT} ${RS_FILE}
+        DEPENDS ${RS_FILE} ${ATM_COMMON_INC}
+        COMMENT "Compiling RS: ${RS_NAME}"
+        VERBATIM
+    )
+    list(APPEND SHADER_OUTPUTS ${RS_OUT})
+endforeach()
+
+set(ATM_CS_SHADERS
+    "Atmosphere/TransmittanceLUT.hlsl|atm_transmittance_cs|main"
+    "Atmosphere/SkyViewLUT.hlsl|atm_skyview_cs|main"
+    "Atmosphere/AtmEnvCubemapCS.hlsl|atm_envcube_cs|main"
+)
+foreach(CS_ENTRY ${ATM_CS_SHADERS})
+    string(REPLACE "|" ";" CS_PARTS "${CS_ENTRY}")
+    list(GET CS_PARTS 0 CS_REL)
+    list(GET CS_PARTS 1 CS_NAME)
+    list(GET CS_PARTS 2 CS_EP)
+    set(CS_FILE "${CMAKE_SOURCE_DIR}/shaders/${CS_REL}")
+    set(CS_OUT  "${SHADER_OUTPUT_DIR}/${CS_NAME}.cso")
+    add_custom_command(
+        OUTPUT ${CS_OUT}
+        COMMAND ${DXC_EXECUTABLE} -T cs_6_0 -E ${CS_EP} ${DXC_SHADER_FLAGS} -Fo ${CS_OUT} ${CS_FILE}
+        DEPENDS ${CS_FILE} ${ATM_COMMON_INC}
+        COMMENT "Compiling CS: ${CS_NAME}"
+        VERBATIM
+    )
+    list(APPEND SHADER_OUTPUTS ${CS_OUT})
+endforeach()
+
+set(ATM_VS_OUT "${SHADER_OUTPUT_DIR}/atm_sky_render_vs.cso")
+add_custom_command(
+    OUTPUT ${ATM_VS_OUT}
+    COMMAND ${DXC_EXECUTABLE} -T vs_6_0 -E VSMain ${DXC_SHADER_FLAGS} -Fo ${ATM_VS_OUT}
+            "${CMAKE_SOURCE_DIR}/shaders/Atmosphere/SkyRenderVS.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Atmosphere/SkyRenderVS.hlsl" ${ATM_COMMON_INC}
+    COMMENT "Compiling VS: atm_sky_render"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${ATM_VS_OUT})
+
+set(ATM_PS_OUT "${SHADER_OUTPUT_DIR}/atm_sky_render_ps.cso")
+add_custom_command(
+    OUTPUT ${ATM_PS_OUT}
+    COMMAND ${DXC_EXECUTABLE} -T ps_6_0 -E PSMain ${DXC_SHADER_FLAGS} -Fo ${ATM_PS_OUT}
+            "${CMAKE_SOURCE_DIR}/shaders/Atmosphere/SkyRenderPS.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Atmosphere/SkyRenderPS.hlsl" ${ATM_COMMON_INC}
+    COMMENT "Compiling PS: atm_sky_render"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${ATM_PS_OUT})
 
 add_custom_target(shaders ALL DEPENDS ${SHADER_OUTPUTS})
 add_dependencies(${PROJECT_NAME} shaders)

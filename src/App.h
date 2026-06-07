@@ -72,4 +72,7 @@ private:
     int m_fpsFrameCount = 0;
     float m_elapsedTime = 0.0f;
     bool m_vsync = false;
+
+    float m_sunElevation = 45.0f;  // degrees above horizon
+    float m_sunAzimuth   = 180.0f; // degrees
 };
