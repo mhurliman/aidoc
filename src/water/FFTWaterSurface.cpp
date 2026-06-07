@@ -540,7 +540,7 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
     ctx.SetDescriptorHeap(m_heap.Get());
 
     // ---- One-time precomputation on first frame ----
-    if (!m_precomputeDone)
+    //if (!m_precomputeDone)
     {
         // Upload noise data then transition to shader-readable state.
         D3D12_TEXTURE_COPY_LOCATION src = {};
@@ -616,8 +616,10 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
         memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
 
         auto timeAlloc = alloc.Allocate(256);
-        time += 60.0f;
-        memcpy(timeAlloc.cpuAddress, &time, sizeof(float));
+        time = time * tweaks.timeScale + 60.0f;
+        struct DynSpecGlobals { float SimulationTime; float Choppiness; };
+        DynSpecGlobals dynGlobals = { time, tweaks.choppiness };
+        memcpy(timeAlloc.cpuAddress, &dynGlobals, sizeof(dynGlobals));
 
         cmd->SetComputeRootSignature(m_computeRootSig.Get());
         ctx.SetPipelineState(DynamicSpectrumPSO.Get());

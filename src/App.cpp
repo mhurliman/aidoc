@@ -405,6 +405,8 @@ void App::Render()
         ImGui::SliderAngle("Wind Direction",    &tweaks.windTheta,       -180.0f, 180.0f);
         ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.01f, 5.0f);
         ImGui::SliderFloat("Small Wave Cutoff", &tweaks.smallWaveCutoff, 0.001f, 0.1f, "%.4f");
+        ImGui::SliderFloat("Choppiness",        &tweaks.choppiness,      0.0f,   1.0f);
+        ImGui::SliderFloat("Time Scale",        &tweaks.timeScale,       0.0f,   2.0f);
         ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
         ImGui::Text("Grid: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
     }

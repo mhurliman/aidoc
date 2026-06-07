@@ -5,6 +5,7 @@ ConstantBuffer<FFTParameters> FFT : register(b0);
 cbuffer Globals : register(b1)
 {
     float SimulationTime;
+    float Choppiness;
 }
 
 Texture2D<float4> H0 : register(t0);
@@ -33,7 +34,7 @@ void main(uint3 DTid : SV_DispatchThreadID)
     float2 ih = float2(-h.y, h.x);
     float2 ikh = ComplexMult(k, ih);
 
-    float2 Offset = ikh / (length(k) + 1e-3);
+    float2 Offset = Choppiness * ikh / (length(k) + 1e-3);
 
     Height[DTid.xy] = h;
     Gradient[DTid.xy] = ikh;

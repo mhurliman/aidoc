@@ -26,10 +26,12 @@ class FFTWaterSurface
 public:
     struct WaterTweaks
     {
-        float windSpeed       = 31.0f;
+        float windSpeed       = 10.0f;
         float windTheta       = 0.0f;   // radians, direction wind blows toward
         float amplitude       = 1.0f;
         float smallWaveCutoff = 0.01f;
+        float choppiness      = 0.5f;   // λ: horizontal displacement scale [0,1]
+        float timeScale       = 0.5f;   // slows or speeds up wave animation
         DirectX::XMFLOAT3 color = { 0.05f, 0.3f, 0.5f };
         bool  visible         = true;
     };
