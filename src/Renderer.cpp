@@ -1,13 +1,46 @@
 #include "Renderer.h"
-#include "resources/ColorBuffer.h"
-#include "resources/DepthBuffer.h"
-#include "resources/Mesh.h"
-#include "resources/Material.h"
-#include "resources/Texture.h"
-#include "resources/Scene.h"
-#include "helpers/Assert.h"
+#include "gfx/ColorBuffer.h"
+#include "gfx/DepthBuffer.h"
+#include "assets/Mesh.h"
+#include "assets/Material.h"
+#include "assets/Texture.h"
+#include "scene/Scene.h"
+#include "util/Assert.h"
 #include <cstring>
+#include <fstream>
 #include <vector>
+
+static std::vector<uint8_t> ReadBlobFile(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open())
+        return {};
+    auto size = (size_t)f.tellg();
+    std::vector<uint8_t> data(size);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
+}
+
+static std::string ResolveShaderPath(const char* filename)
+{
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string dir(exePath);
+    auto pos = dir.find_last_of("\\/");
+    if (pos != std::string::npos)
+        dir = dir.substr(0, pos + 1);
+    return dir + "shaders\\" + filename;
+}
+
+static ComPtr<ID3D12RootSignature> LoadRootSignature(ID3D12Device* device, const char* blobName)
+{
+    auto blob = ReadBlobFile(ResolveShaderPath(blobName));
+    ComPtr<ID3D12RootSignature> rootSig;
+    ASSERT_SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(),
+                                                  IID_PPV_ARGS(&rootSig)));
+    return rootSig;
+}
 
 void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameCount)
 {
@@ -23,6 +56,7 @@ void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameC
     // Create null SRV for materials without textures
     UINT nullSrvIndex;
     m_nullSrvHandle = m_resourceManager.GetSRVHeap().Allocate(nullSrvIndex);
+    
     D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
     nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -30,7 +64,7 @@ void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameC
     nullDesc.Texture2D.MipLevels = 1;
     device->CreateShaderResourceView(nullptr, &nullDesc, m_nullSrvHandle);
 
-    CreateRootSignature();
+    m_rootSignature = LoadRootSignature(device, "pbr_rs.cso");
     InitShaders();
 }
 
@@ -38,72 +72,6 @@ void Renderer::Shutdown()
 {
     m_resourceManager.Shutdown();
     m_linearAllocator.Shutdown();
-}
-
-void Renderer::CreateRootSignature()
-{
-    D3D12_ROOT_PARAMETER rootParams[4] = {};
-
-    // Root param 0: FrameConstants CBV at b0
-    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParams[0].Descriptor.ShaderRegister = 0;
-    rootParams[0].Descriptor.RegisterSpace = 0;
-    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    // Root param 1: MaterialConstants CBV at b1
-    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParams[1].Descriptor.ShaderRegister = 1;
-    rootParams[1].Descriptor.RegisterSpace = 0;
-    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    // Root param 2: Texture descriptor table (t0, t1)
-    D3D12_DESCRIPTOR_RANGE srvRanges[2] = {};
-    srvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRanges[0].NumDescriptors = 1;
-    srvRanges[0].BaseShaderRegister = 0;
-    srvRanges[0].RegisterSpace = 0;
-    srvRanges[0].OffsetInDescriptorsFromTableStart = 0;
-
-    srvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRanges[1].NumDescriptors = 1;
-    srvRanges[1].BaseShaderRegister = 1;
-    srvRanges[1].RegisterSpace = 0;
-    srvRanges[1].OffsetInDescriptorsFromTableStart = 1;
-
-    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rootParams[2].DescriptorTable.NumDescriptorRanges = 2;
-    rootParams[2].DescriptorTable.pDescriptorRanges = srvRanges;
-    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    // Root param 3: Lights StructuredBuffer SRV at t2
-    rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    rootParams[3].Descriptor.ShaderRegister = 2;
-    rootParams[3].Descriptor.RegisterSpace = 0;
-    rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_STATIC_SAMPLER_DESC staticSampler = {};
-    staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSampler.ShaderRegister = 0;
-    staticSampler.RegisterSpace = 0;
-    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
-
-    D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-    rootSigDesc.NumParameters = 4;
-    rootSigDesc.pParameters = rootParams;
-    rootSigDesc.NumStaticSamplers = 1;
-    rootSigDesc.pStaticSamplers = &staticSampler;
-    rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-    ComPtr<ID3DBlob> signature, error;
-    ASSERT_SUCCEEDED(D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                                 &signature, &error));
-    ASSERT_SUCCEEDED(m_device->CreateRootSignature(0, signature->GetBufferPointer(),
-                                                   signature->GetBufferSize(),
-                                                   IID_PPV_ARGS(&m_rootSignature)));
 }
 
 void Renderer::InitShaders()
@@ -120,6 +88,32 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
     m_linearAllocator.SetCurrentFrame(frameIndex);
     m_transientHeap.Reset();
 
+    m_currentRT = &rt;
+    m_currentDS = &ds;
+
+    if (!m_sceneTargetsInitialized)
+    {
+        auto w = static_cast<UINT>(viewport.Width);
+        auto h = static_cast<UINT>(viewport.Height);
+        m_sceneColorCopy.Create(m_device, DXGI_FORMAT_R8G8B8A8_UNORM, w, h,
+                                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        ASSERT_SUCCEEDED(m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_sceneColorSRVHeap)));
+        m_sceneColorSRVHandle = m_sceneColorSRVHeap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_sceneColorCopy.GetResource(), &srvDesc, m_sceneColorSRVHandle);
+
+        m_sceneTargetsInitialized = true;
+    }
+
     m_gfxContext.Begin(allocator);
     m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
     m_gfxContext.SetRootSignature(m_rootSignature.Get());
@@ -131,8 +125,8 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
     m_gfxContext.SetRenderTarget(rt, ds);
 }
 
-void Renderer::RenderScene(const Scene& scene, const View& view,
-                           const FrameConstants& frameConstants)
+void Renderer::RenderScene(Scene& scene, const View& view,
+                           const FrameConstants& frameConstants, float elapsedTime)
 {
     // Build lights buffer from scene
     std::vector<GpuLight> gpuLights;
@@ -169,6 +163,8 @@ void Renderer::RenderScene(const Scene& scene, const View& view,
 
     for (const auto& entity : scene.GetEntities())
     {
+        if (!entity.visible)
+            continue;
         const auto& mesh = entity.mesh;
         m_gfxContext.SetVertexBuffer(mesh->GetVertexBufferView());
         m_gfxContext.SetIndexBuffer(mesh->GetIndexBufferView());
@@ -181,6 +177,43 @@ void Renderer::RenderScene(const Scene& scene, const View& view,
 
             m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, sub.baseVertex, 0);
         }
+    }
+
+    // Extract light direction from first directional light, fall back to a default.
+    DirectX::XMFLOAT3 lightDir = { -0.3f, -1.0f, 0.5f };
+    if (!scene.GetDirectionalLights().empty())
+        lightDir = scene.GetDirectionalLights()[0].direction;
+
+    auto& water = scene.GetWaterSurface();
+    water.Update(m_gfxContext, m_linearAllocator, elapsedTime);
+
+    // Restore renderer state after water compute passes swap the descriptor heap.
+    m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
+    m_gfxContext.SetRootSignature(m_rootSignature.Get());
+
+    if (water.tweaks.visible)
+    {
+        // Copy scene color into the snapshot buffer for water refraction sampling.
+        m_gfxContext.TransitionResource(*m_currentRT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_gfxContext.TransitionResource(m_sceneColorCopy, D3D12_RESOURCE_STATE_COPY_DEST);
+        m_gfxContext.FlushResourceBarriers();
+        m_gfxContext.GetCommandList()->CopyResource(m_sceneColorCopy.GetResource(),
+                                                    m_currentRT->GetResource());
+        m_gfxContext.TransitionResource(*m_currentRT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        m_gfxContext.TransitionResource(m_sceneColorCopy, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+        // Transition depth to combined read state so the water PS can sample it.
+        m_gfxContext.TransitionResource(*m_currentDS,
+            D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+        water.Render(m_gfxContext, m_linearAllocator, view, lightDir,
+                     m_currentDS->GetSRV(), m_sceneColorSRVHandle);
+
+        m_gfxContext.TransitionResource(*m_currentDS, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+        // Restore renderer heap again after water render.
+        m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
+        m_gfxContext.SetRootSignature(m_rootSignature.Get());
     }
 }
 

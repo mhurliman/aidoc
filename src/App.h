@@ -9,11 +9,11 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <memory>
-#include "helpers/FlyCamera.h"
-#include "helpers/InputManager.h"
-#include "resources/ColorBuffer.h"
-#include "resources/DepthBuffer.h"
-#include "resources/Scene.h"
+#include "util/FlyCamera.h"
+#include "util/InputManager.h"
+#include "gfx/ColorBuffer.h"
+#include "gfx/DepthBuffer.h"
+#include "scene/Scene.h"
 
 class Renderer;
 using Microsoft::WRL::ComPtr;
@@ -70,5 +70,6 @@ private:
     float m_fps = 0.0f;
     float m_fpsAccumulator = 0.0f;
     int m_fpsFrameCount = 0;
+    float m_elapsedTime = 0.0f;
     bool m_vsync = false;
 };

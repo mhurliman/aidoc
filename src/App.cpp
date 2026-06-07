@@ -1,9 +1,9 @@
 #include "App.h"
 #include "Renderer.h"
 #include "IRenderer.h"
-#include "resources/Mesh.h"
-#include "resources/Material.h"
-#include "helpers/Assert.h"
+#include "assets/Mesh.h"
+#include "assets/Material.h"
+#include "util/Assert.h"
 #include <cmath>
 #include <cstring>
 #include <windowsx.h>
@@ -140,6 +140,21 @@ void App::LoadScene()
 {
     m_scene.Load(ResolveExePath("scenes/testscene.json"), m_device.Get(),
                  m_renderer->GetResourceManager());
+
+    WaterDesc waterDesc = {};
+    waterDesc.N = waterDesc.M = 256;
+    waterDesc.TileSize = 10.0f;
+    m_scene.CreateWater(m_device.Get(), waterDesc);
+
+    const std::string envFaces[6] = {
+        ResolveExePath("textures/TropicalSunnyDay_px.jpg"),
+        ResolveExePath("textures/TropicalSunnyDay_nx.jpg"),
+        ResolveExePath("textures/TropicalSunnyDay_py.jpg"),
+        ResolveExePath("textures/TropicalSunnyDay_ny.jpg"),
+        ResolveExePath("textures/TropicalSunnyDay_pz.jpg"),
+        ResolveExePath("textures/TropicalSunnyDay_nz.jpg"),
+    };
+    m_scene.GetWaterSurface().LoadEnvironmentMap(m_commandQueue.Get(), envFaces);
 }
 
 void App::InitImGui(HWND hwnd)
@@ -225,6 +240,7 @@ void App::Update(float dt)
     }
 
     m_camera.Update(dt, m_inputManager);
+    m_elapsedTime += dt;
 
     m_fpsFrameCount++;
     m_fpsAccumulator += dt;
@@ -279,13 +295,15 @@ void App::Render()
     XMStoreFloat4x4(&view.projMatrix, XMMatrixTranspose(projMat));
     XMStoreFloat4x4(&view.viewProjMatrix, XMMatrixTranspose(viewMat * projMat));
     view.position = m_camera.GetPosition();
+    view.nearZ    = 0.1f;
+    view.farZ     = 1000.0f;
 
     // Build per-frame constants
     FrameConstants frameConstants = {};
     frameConstants.viewProj = view.viewProjMatrix;
     frameConstants.cameraPos = view.position;
 
-    m_renderer->RenderScene(m_scene, view, frameConstants);
+    m_renderer->RenderScene(m_scene, view, frameConstants, m_elapsedTime);
 
     // ImGui
     ImGui_ImplDX12_NewFrame();
@@ -301,13 +319,14 @@ void App::Render()
     ImGui::Separator();
 
     int entityIdx = 0;
-    for (const auto& entity : m_scene.GetEntities())
+    for (auto& entity : m_scene.GetEntities())
     {
         ImGui::PushID(entityIdx);
         char entityLabel[128];
         snprintf(entityLabel, sizeof(entityLabel), "Entity %d", entityIdx++);
         if (ImGui::CollapsingHeader(entityLabel, ImGuiTreeNodeFlags_DefaultOpen))
         {
+            ImGui::Checkbox("Visible", &entity.visible);
             const auto& subMeshes = entity.mesh->GetSubMeshes();
             auto& editMaterials = entity.mesh->GetMaterials();
 
@@ -372,6 +391,22 @@ void App::Render()
             }
         }
         ImGui::PopID();
+    }
+
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Water", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        auto& water  = m_scene.GetWaterSurface();
+        auto& tweaks = water.tweaks;
+        const auto& desc = water.GetDesc();
+
+        ImGui::Checkbox("Visible##water", &tweaks.visible);
+        ImGui::SliderFloat("Wind Speed",        &tweaks.windSpeed,       0.1f, 100.0f);
+        ImGui::SliderAngle("Wind Direction",    &tweaks.windTheta,       -180.0f, 180.0f);
+        ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.01f, 5.0f);
+        ImGui::SliderFloat("Small Wave Cutoff", &tweaks.smallWaveCutoff, 0.001f, 0.1f, "%.4f");
+        ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
+        ImGui::Text("Grid: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
     }
 
     ImGui::End();

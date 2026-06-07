@@ -1,10 +1,11 @@
 #pragma once
 
 #include "IRenderer.h"
-#include "helpers/GraphicsContext.h"
-#include "helpers/LinearAllocator.h"
-#include "helpers/DescriptorHeap.h"
-#include "managers/ResourceManager.h"
+#include "gfx/GraphicsContext.h"
+#include "gfx/LinearAllocator.h"
+#include "gfx/DescriptorHeap.h"
+#include "gfx/PixelBuffer.h"
+#include "assets/ResourceManager.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <vector>
@@ -25,8 +26,8 @@ public:
     void BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, DepthBuffer& ds,
                     const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor, UINT frameIndex,
                     UINT64 completedFenceValue);
-    void RenderScene(const Scene& scene, const View& view,
-                     const FrameConstants& frameConstants) override;
+    void RenderScene(Scene& scene, const View& view,
+                     const FrameConstants& frameConstants, float elapsedTime) override;
     UINT64 EndFrame(ColorBuffer& rt, ID3D12Fence* fence, UINT64& nextFenceValue);
 
     ResourceManager& GetResourceManager() { return m_resourceManager; }
@@ -34,7 +35,6 @@ public:
     ID3D12GraphicsCommandList* GetCommandList() { return m_gfxContext.GetCommandList(); }
 
 private:
-    void CreateRootSignature();
     void InitShaders();
 
     ID3D12Device* m_device = nullptr;
@@ -45,4 +45,12 @@ private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     D3D12_CPU_DESCRIPTOR_HANDLE m_nullSrvHandle = {};
     UINT m_frameCount = 0;
+
+    ColorBuffer* m_currentRT = nullptr;
+    DepthBuffer* m_currentDS = nullptr;
+
+    PixelBuffer m_sceneColorCopy;
+    ComPtr<ID3D12DescriptorHeap> m_sceneColorSRVHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE  m_sceneColorSRVHandle = {};
+    bool m_sceneTargetsInitialized = false;
 };

@@ -10,6 +10,8 @@ struct View
     DirectX::XMFLOAT4X4 projMatrix;
     DirectX::XMFLOAT4X4 viewProjMatrix;
     DirectX::XMFLOAT3 position;
+    float nearZ = 0.1f;
+    float farZ  = 1000.0f;
 };
 
 struct FrameConstants
@@ -23,6 +25,6 @@ class IRenderer
 {
 public:
     virtual ~IRenderer() = default;
-    virtual void RenderScene(const Scene& scene, const View& view,
-                             const FrameConstants& frameConstants) = 0;
+    virtual void RenderScene(Scene& scene, const View& view,
+                             const FrameConstants& frameConstants, float elapsedTime) = 0;
 };

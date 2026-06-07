@@ -1,3 +1,5 @@
+#include "Common.hlsli"
+
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT 1
 #define LIGHT_SPOT 2
@@ -47,6 +49,7 @@ struct PSInput {
     float2 uv        : TEXCOORD;
 };
 
+[RootSignature(ROOTSIG)]
 PSInput VSMain(VSInput input) {
     PSInput output;
     output.clipPos = mul(float4(input.position, 1.0), viewProj);
