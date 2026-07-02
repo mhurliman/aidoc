@@ -296,11 +296,11 @@ void Atmosphere::Update(CommandContext& ctx, LinearAllocator& alloc,
         m_transmittanceDirty = false;
     }
 
-    const D3D12_RESOURCE_STATES kSrv =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // NON_PIXEL_SHADER_RESOURCE only — compute queues do not support PIXEL_SHADER_RESOURCE.
+    // Render() promotes both LUTs to PSR|NPSR before the sky draw.
+    const D3D12_RESOURCE_STATES kSrv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-    // Transmittance LUT must be SRV-readable (includes NON_PIXEL) for the SkyView CS.
+    // Transmittance LUT must be SRV-readable for the SkyView CS.
     ctx.TransitionResource(m_transmittanceLUT, kSrv);
     ctx.TransitionResource(m_skyViewLUT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ctx.FlushResourceBarriers();
@@ -410,17 +410,18 @@ void Atmosphere::Update(CommandContext& ctx, LinearAllocator& alloc,
             cmd->Dispatch(kEnvCubeSize / 8, kEnvCubeSize / 16, 4);
         }
 
-        // UAV barrier then transition to PSR so the water shader can sample it.
+        // UAV barrier then transition to NPSR — compute queues cannot use PSR.
+        // Render() promotes to PSR on the graphics queue before the water draw.
         D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         barriers[0].UAV.pResource = m_envCubeMap.Get();
         barriers[1].Type                        = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[1].Transition.pResource        = m_envCubeMap.Get();
         barriers[1].Transition.StateBefore      = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barriers[1].Transition.StateAfter       = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barriers[1].Transition.StateAfter       = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barriers[1].Transition.Subresource      = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(2, barriers);
-        m_envCubeState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_envCubeState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
 }
 
@@ -428,9 +429,50 @@ void Atmosphere::Update(CommandContext& ctx, LinearAllocator& alloc,
 // Render — fullscreen sky pass
 // ---------------------------------------------------------------------------
 
+void Atmosphere::PrepareForCompute(CommandContext& ctx)
+{
+    const D3D12_RESOURCE_STATES kNpsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // TransitionResource is a no-op if already in NPSR, so this is always safe to call.
+    ctx.TransitionResource(m_skyViewLUT,       kNpsr);
+    ctx.TransitionResource(m_transmittanceLUT, kNpsr);
+    if (m_envCubeState != kNpsr)
+    {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                        = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource        = m_envCubeMap.Get();
+        b.Transition.StateBefore      = m_envCubeState;
+        b.Transition.StateAfter       = kNpsr;
+        b.Transition.Subresource      = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ctx.GetCommandList()->ResourceBarrier(1, &b);
+        m_envCubeState = kNpsr;
+    }
+    ctx.FlushResourceBarriers();
+}
+
 void Atmosphere::Render(GraphicsContext& ctx, LinearAllocator& alloc, const View& view)
 {
     auto* cmd = ctx.GetCommandList();
+
+    // Promote LUTs from NPSR (written on compute queue) to PSR|NPSR for pixel shader reads.
+    const D3D12_RESOURCE_STATES kSrvAll =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ctx.TransitionResource(m_skyViewLUT,       kSrvAll);
+    ctx.TransitionResource(m_transmittanceLUT, kSrvAll);
+
+    // Promote envCubeMap from NPSR to PSR so the water shader can sample it after this pass.
+    if (m_envCubeState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+    {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                        = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource        = m_envCubeMap.Get();
+        b.Transition.StateBefore      = m_envCubeState;
+        b.Transition.StateAfter       = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource      = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1, &b);
+        m_envCubeState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    ctx.FlushResourceBarriers();
 
     // Build inverse view-proj
     XMMATRIX vp = XMLoadFloat4x4(&view.viewProjMatrix);

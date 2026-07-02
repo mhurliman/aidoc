@@ -12,8 +12,10 @@ struct HsPatchOutput
 
 float EdgeTessFactor(float3 p0, float3 p1)
 {
+    float maxTess = Water.ColorMax.w;
+    float tessDistance = Water.CascTess.w;
     float dist = length((p0 + p1) * 0.5 - Frame.CameraPosition);
-    return clamp(Water.MaxTessellation * (1.0 - dist / Water.TessDistance), 1.0, Water.MaxTessellation);
+    return clamp(maxTess * (1.0 - dist / tessDistance), 1.0, maxTess);
 }
 
 // Control point order: [0]=TL, [1]=BL, [2]=TR, [3]=BR

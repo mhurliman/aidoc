@@ -44,15 +44,31 @@ static ComPtr<ID3D12RootSignature> LoadRootSignature(ID3D12Device* device, const
 
 void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameCount)
 {
-    m_device     = device;
-    m_frameCount = frameCount;
+    m_device        = device;
+    m_graphicsQueue = queue;
+    m_frameCount    = frameCount;
 
     m_gfxContext.Init(device, queue);
+
+    // Async compute queue — runs atmosphere LUT + water FFT in parallel with graphics.
+    D3D12_COMMAND_QUEUE_DESC cqDesc = {};
+    cqDesc.Type     = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    cqDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    ASSERT_SUCCEEDED(device->CreateCommandQueue(&cqDesc, IID_PPV_ARGS(&m_computeQueue)));
+
+    m_computeAllocators.resize(frameCount);
+    for (UINT i = 0; i < frameCount; ++i)
+        ASSERT_SUCCEEDED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_computeAllocators[i])));
+
+    ASSERT_SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_computeFence)));
+    m_computeContext.Init(device, m_computeQueue.Get(), D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
     m_profiler.Init(device, queue, (int)frameCount);
 
     m_resourceManager.Init(device, queue);
     m_transientHeap.Init(device, 1024, 1);
-    m_linearAllocator.Init(device, 64 * 1024, frameCount);
+    m_linearAllocator.Init(device, 256 * 1024, frameCount);
 
     // Create null SRV for materials without textures
     UINT nullSrvIndex;
@@ -116,6 +132,7 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
         m_sceneTargetsInitialized = true;
     }
 
+    m_computeContext.Begin(m_computeAllocators[frameIndex].Get());
     m_gfxContext.Begin(allocator);
 
     auto* cmd = m_gfxContext.GetCommandList();
@@ -168,26 +185,42 @@ void Renderer::RenderScene(Scene& scene, const View& view,
 
     auto* cmd = m_gfxContext.GetCommandList();
 
-    // Atmosphere: compute LUTs then render sky as background before opaque geometry.
-    auto& atm = scene.GetAtmosphere();
+    // -------------------------------------------------------------------------
+    // Async compute phase — atmosphere LUTs + water FFT on the compute queue.
+    // The graphics queue issues a GPU-side Wait after this block so it won't
+    // consume the outputs until compute has finished signaling.
+    // -------------------------------------------------------------------------
+
+    auto& atm   = scene.GetAtmosphere();
+    auto& water = scene.GetWaterSurface();
+
+    DirectX::XMFLOAT3 sunDirToward = { 0.0f, 1.0f, 0.0f };
     if (atm.visible)
     {
         DirectX::XMFLOAT3 sunDir = { -0.3f, -1.0f, 0.5f };
         if (!scene.GetDirectionalLights().empty())
             sunDir = scene.GetDirectionalLights()[0].direction;
-        // Flip to "toward sun" convention and normalize (unnormalized direction causes
-        // mu_s > 1 in the Mie phase function, producing NaN via pow(negative, 1.5)).
+        // Flip to "toward sun" and normalize (unnormalized causes mu_s > 1 → NaN in Mie phase).
         DirectX::XMVECTOR sdv = DirectX::XMVector3Normalize(
             DirectX::XMVectorSet(-sunDir.x, -sunDir.y, -sunDir.z, 0.0f));
-        DirectX::XMFLOAT3 sunDirToward;
         DirectX::XMStoreFloat3(&sunDirToward, sdv);
 
-        m_profiler.BeginScope("Atmosphere LUT", cmd);
-        atm.Update(m_gfxContext, m_linearAllocator, sunDirToward, view.position.y);
-        m_profiler.EndScope(cmd);
+        atm.Update(m_computeContext, m_linearAllocator, sunDirToward, view.position.y);
+    }
 
+    water.Update(m_computeContext, m_linearAllocator, elapsedTime);
+
+    // Execute compute work and insert a GPU-side dependency into the graphics queue.
+    UINT64 computeVal = m_computeContext.Finish(m_computeFence.Get(), m_nextComputeFenceValue);
+    m_graphicsQueue->Wait(m_computeFence.Get(), computeVal);
+
+    // -------------------------------------------------------------------------
+    // Graphics phase — sky, opaque meshes, water render.
+    // -------------------------------------------------------------------------
+
+    if (atm.visible)
+    {
         m_profiler.BeginScope("Sky Render", cmd);
-        // Restore renderer RTV before sky render
         m_gfxContext.SetRenderTarget(*m_currentRT, *m_currentDS);
         atm.Render(m_gfxContext, m_linearAllocator, view);
         m_profiler.EndScope(cmd);
@@ -218,7 +251,6 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         {
             auto& mat = materials[sub.materialIndex];
             mat->Bind(m_gfxContext, m_linearAllocator, m_transientHeap, m_device, m_nullSrvHandle);
-
             m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, sub.baseVertex, 0);
         }
     }
@@ -228,15 +260,6 @@ void Renderer::RenderScene(Scene& scene, const View& view,
     DirectX::XMFLOAT3 lightDir = { -0.3f, -1.0f, 0.5f };
     if (!scene.GetDirectionalLights().empty())
         lightDir = scene.GetDirectionalLights()[0].direction;
-
-    auto& water = scene.GetWaterSurface();
-    m_profiler.BeginScope("FFT Update", cmd);
-    water.Update(m_gfxContext, m_linearAllocator, elapsedTime);
-    m_profiler.EndScope(cmd);
-
-    // Restore renderer state after water compute passes swap the descriptor heap.
-    m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
-    m_gfxContext.SetRootSignature(m_rootSignature.Get());
 
     if (water.tweaks.visible)
     {
@@ -265,6 +288,11 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
         m_gfxContext.SetRootSignature(m_rootSignature.Get());
     }
+
+    // Demote shared resources from PSR|NPSR back to NPSR so the next frame's compute
+    // queue can re-acquire them without encountering PIXEL_SHADER_RESOURCE states in barriers.
+    atm.PrepareForCompute(m_gfxContext);
+    water.PrepareForCompute(m_gfxContext);
 }
 
 UINT64 Renderer::EndFrame(ColorBuffer& rt, ID3D12Fence* fence, UINT64& nextFenceValue)

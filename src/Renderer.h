@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IRenderer.h"
+#include "gfx/CommandContext.h"
 #include "gfx/GraphicsContext.h"
 #include "gfx/GpuProfiler.h"
 #include "gfx/LinearAllocator.h"
@@ -31,6 +32,10 @@ public:
                      const FrameConstants& frameConstants, float elapsedTime) override;
     UINT64 EndFrame(ColorBuffer& rt, ID3D12Fence* fence, UINT64& nextFenceValue);
 
+    // Drop size-dependent targets so they are recreated at the new size on the next BeginFrame.
+    // Caller must ensure the GPU is idle first.
+    void OnResize() { m_sceneTargetsInitialized = false; }
+
     ResourceManager& GetResourceManager() { return m_resourceManager; }
     TransientDescriptorHeap& GetTransientHeap() { return m_transientHeap; }
     ID3D12GraphicsCommandList* GetCommandList() { return m_gfxContext.GetCommandList(); }
@@ -39,11 +44,19 @@ public:
 private:
     void InitShaders();
 
-    ID3D12Device* m_device        = nullptr;
-    UINT          m_frameCount    = 0;
-    UINT          m_frameIndex    = 0;
+    ID3D12Device*       m_device        = nullptr;
+    ID3D12CommandQueue* m_graphicsQueue = nullptr;
+    UINT                m_frameCount    = 0;
+    UINT                m_frameIndex    = 0;
+
     GraphicsContext m_gfxContext;
-    GpuProfiler   m_profiler;
+    CommandContext  m_computeContext;
+    GpuProfiler     m_profiler;
+
+    ComPtr<ID3D12CommandQueue>                        m_computeQueue;
+    std::vector<ComPtr<ID3D12CommandAllocator>>       m_computeAllocators;
+    ComPtr<ID3D12Fence>                               m_computeFence;
+    UINT64                                            m_nextComputeFenceValue = 1;
     LinearAllocator m_linearAllocator;
     TransientDescriptorHeap m_transientHeap;
     ResourceManager m_resourceManager;

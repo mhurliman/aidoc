@@ -54,6 +54,11 @@ public:
     // Force the transmittance LUT to recompute on the next Update() call.
     void MarkDirty() { m_transmittanceDirty = true; }
 
+    // Demote shared resources from PSR|NPSR back to NPSR on the graphics command list.
+    // Must be called at the end of every graphics frame so the next frame's async compute
+    // queue can barrier them without encountering PIXEL_SHADER_RESOURCE states.
+    void PrepareForCompute(CommandContext& ctx);
+
     // Returns the atmosphere env cubemap resource (128×128×6, RGBA16F).
     // Valid after the first Update() call; in PIXEL_SHADER_RESOURCE state after Update().
     ID3D12Resource* GetEnvCubeResource() const { return m_envCubeMap.Get(); }

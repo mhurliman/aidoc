@@ -136,6 +136,47 @@ void App::InitViewport()
     m_scissorRect = {0, 0, static_cast<LONG>(WindowWidth), static_cast<LONG>(WindowHeight)};
 }
 
+void App::Resize(UINT width, UINT height)
+{
+    // Ignore pre-init messages, minimize (0×0), and no-op resizes.
+    if (!m_swapChain || width == 0 || height == 0)
+        return;
+    if (width == m_width && height == m_height)
+        return;
+
+    // All in-flight GPU work must finish before back buffers / depth are released.
+    WaitForGpu();
+
+    // Drop references to the old swap-chain back buffers (required by ResizeBuffers).
+    for (UINT i = 0; i < FrameCount; ++i)
+        m_displayBuffers[i].Reset();
+
+    ASSERT_SUCCEEDED(m_swapChain->ResizeBuffers(
+        FrameCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0));
+
+    // Recreate RTVs into the existing heap and the depth buffer at the new size.
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < FrameCount; ++i)
+    {
+        m_displayBuffers[i].InitFromSwapChain(m_device.Get(), m_swapChain.Get(), i, rtvHandle);
+        rtvHandle.ptr += m_rtvDescriptorSize;
+    }
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+    m_depthBuffer.Create(m_device.Get(), width, height);
+
+    m_width  = width;
+    m_height = height;
+    m_viewport = {0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+    m_scissorRect = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+
+    m_camera.SetPerspective(XM_PIDIV4,
+        static_cast<float>(width) / static_cast<float>(height), 0.1f, 1000.0f);
+
+    // Size-dependent render targets (scene-color copy) are rebuilt on the next BeginFrame.
+    m_renderer->OnResize();
+}
+
 void App::LoadScene()
 {
     m_scene.Load(ResolveExePath("scenes/testscene.json"), m_device.Get(),
@@ -143,7 +184,7 @@ void App::LoadScene()
 
     WaterDesc waterDesc = {};
     waterDesc.N = waterDesc.M = 256;
-    waterDesc.TileSize = 10.0f;
+    waterDesc.TileSize = 512.0f;  // mesh tile span = largest cascade; cascades sized internally
     m_scene.CreateWater(m_device.Get(), waterDesc, m_commandQueue.Get());
 
     m_scene.CreateAtmosphere(m_device.Get());
@@ -194,6 +235,10 @@ void App::OnWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
+    case WM_SIZE:
+        // wParam == SIZE_MINIMIZED yields 0×0 via LOWORD/HIWORD, which Resize() ignores.
+        Resize(LOWORD(lParam), HIWORD(lParam));
+        break;
     case WM_KEYDOWN:
         m_inputManager.OnKeyDown(static_cast<int>(wParam));
         break;
@@ -423,15 +468,15 @@ void App::Render()
         ImGui::SameLine();
         ImGui::Checkbox("Wireframe", &tweaks.wireframe);
         ImGui::SliderInt("Tile Count",      &tweaks.tileCount,      1,  9);
-        ImGui::SliderInt("Mesh Resolution", &tweaks.meshResolution, 4, 64);
+        ImGui::SliderInt("Mesh Resolution", &tweaks.meshResolution, 4, 512);
         ImGui::SliderFloat("Wind Speed",        &tweaks.windSpeed,       0.1f, 100.0f);
         ImGui::SliderAngle("Wind Direction",    &tweaks.windTheta,       -180.0f, 180.0f);
-        ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.01f, 5.0f);
+        ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.0f, 0.25f, "%.3f");
         ImGui::SliderFloat("Small Wave Cutoff", &tweaks.smallWaveCutoff, 0.001f, 0.1f, "%.4f");
         ImGui::SliderFloat("Choppiness",        &tweaks.choppiness,      0.0f,   1.0f);
         ImGui::SliderFloat("Time Scale",        &tweaks.timeScale,       0.0f,   2.0f);
-        ImGui::SliderFloat("Max Tess",          &tweaks.maxTessellation, 1.0f,  64.0f);
-        ImGui::SliderFloat("Tess Distance",     &tweaks.tessDistance,    5.0f, 200.0f);
+        ImGui::SliderFloat("Max Tess",          &tweaks.maxTessellation, 1.0f,   64.0f);
+        ImGui::SliderFloat("Tess Distance",     &tweaks.tessDistance,    0.0f, 1000.0f);
         ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
 
         const auto& specPlot = water.GetSpectrumPlot();

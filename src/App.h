@@ -45,6 +45,10 @@ private:
     void InitImGui(HWND hwnd);
     void WaitForGpu();
     void WaitForFrame(UINT frameIndex);
+    void Resize(UINT width, UINT height);
+
+    UINT m_width  = WindowWidth;
+    UINT m_height = WindowHeight;
 
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12CommandQueue> m_commandQueue;

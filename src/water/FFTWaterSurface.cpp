@@ -77,6 +77,11 @@ void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc, ID3D12Co
     m_device = device;
     m_desc   = desc;
 
+    // Cascade tile sizes (metres): swell → mid waves → chop. Largest == mesh tile size.
+    static const float kCascadeTileSizes[kNumCascades] = { 512.0f, 64.0f, 8.0f };
+    for (int c = 0; c < kNumCascades; ++c)
+        m_cascades[c].tileSize = kCascadeTileSizes[c];
+
     int n = desc.N;
     m_log2N = 0;
     while ((1 << m_log2N) < n)
@@ -104,25 +109,30 @@ void FFTWaterSurface::UploadNoiseSync(ID3D12CommandQueue* queue)
     ASSERT_SUCCEEDED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
         tempAlloc.Get(), nullptr, IID_PPV_ARGS(&tempCmd)));
 
-    D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource       = m_noiseUpload.Get();
-    src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint = m_noiseFootprint;
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        Cascade& cs = m_cascades[c];
 
-    D3D12_TEXTURE_COPY_LOCATION dst = {};
-    dst.pResource        = m_noise.GetResource();
-    dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource       = cs.noiseUpload.Get();
+        src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = cs.noiseFootprint;
 
-    tempCmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource        = cs.noise.GetResource();
+        dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
 
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource   = m_noise.GetResource();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    tempCmd->ResourceBarrier(1, &barrier);
+        tempCmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = cs.noise.GetResource();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        tempCmd->ResourceBarrier(1, &barrier);
+    }
     tempCmd->Close();
 
     ID3D12CommandList* lists[] = { tempCmd.Get() };
@@ -139,7 +149,8 @@ void FFTWaterSurface::UploadNoiseSync(ID3D12CommandQueue* queue)
     }
     CloseHandle(ev);
 
-    m_noise.SetCurrentState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    for (int c = 0; c < kNumCascades; ++c)
+        m_cascades[c].noise.SetCurrentState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,34 +258,41 @@ void FFTWaterSurface::CreateTextures()
     constexpr D3D12_RESOURCE_FLAGS kUAV = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr D3D12_RESOURCE_STATES kUAVState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
-    // Noise: SRV-only, data arrives via CopyTextureRegion on first Update.
-    m_noise.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N,
-                   D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    m_noise.SetDebugName(L"Water/Noise");
-
-    m_h0.Create        (m_device, DXGI_FORMAT_R32G32B32A32_FLOAT, N, N, kUAV, kUAVState);
-    m_heightFreq.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
-    m_gradFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
-    m_dispFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
+    // Shared working buffers (reused serially across cascades).
     m_pingpong[0].Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
     m_pingpong[1].Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
-    m_h0.SetDebugName        (L"Water/H0Spectrum");
-    m_heightFreq.SetDebugName(L"Water/HeightFreq");
-    m_gradFreq.SetDebugName  (L"Water/GradFreq");
-    m_dispFreq.SetDebugName  (L"Water/DispFreq");
     m_pingpong[0].SetDebugName(L"Water/PingPong0");
     m_pingpong[1].SetDebugName(L"Water/PingPong1");
 
-    // Twiddle factor table: log2N columns, N rows.
+    // Twiddle factor table: log2N columns, N rows. Depends only on N → shared.
     m_precomputed.Create(m_device, DXGI_FORMAT_R32G32B32A32_FLOAT, m_log2N, N, kUAV, kUAVState);
     m_precomputed.SetDebugName(L"Water/TwiddleFactors");
 
-    m_heightMap.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
-    m_gradMap.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
-    m_dispMap.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
-    m_heightMap.SetDebugName(L"Water/HeightMap");
-    m_gradMap.SetDebugName  (L"Water/GradientMap");
-    m_dispMap.SetDebugName  (L"Water/DisplacementMap");
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        Cascade& cs = m_cascades[c];
+
+        // Noise: SRV-only, data arrives via CopyTextureRegion on first Update.
+        cs.noise.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N,
+                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        cs.h0.Create        (m_device, DXGI_FORMAT_R32G32B32A32_FLOAT, N, N, kUAV, kUAVState);
+        cs.heightFreq.Create(m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
+        cs.gradFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
+        cs.dispFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
+        cs.heightMap.Create (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+        cs.gradMap.Create   (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+        cs.dispMap.Create   (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+
+        wchar_t name[64];
+        swprintf_s(name, L"Water/C%d/Noise",      c); cs.noise.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/H0",         c); cs.h0.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/HeightFreq", c); cs.heightFreq.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/GradFreq",   c); cs.gradFreq.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/DispFreq",   c); cs.dispFreq.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/HeightMap",  c); cs.heightMap.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/GradMap",    c); cs.gradMap.SetDebugName(name);
+        swprintf_s(name, L"Water/C%d/DispMap",    c); cs.dispMap.SetDebugName(name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,25 +378,43 @@ void FFTWaterSurface::BuildDescriptorTables()
         U(u0, base + 3); U(u1, base + 4); U(u2, base + 5);
     };
 
-    fillTable(kPhillipsTable,   &m_noise,       nullptr,        nullptr, &m_h0,         nullptr,       nullptr);
-    fillTable(kDynSpecTable,    &m_h0,          nullptr,        nullptr, &m_heightFreq, &m_gradFreq,   &m_dispFreq);
-    fillTable(kPrecomputeTable, nullptr,        nullptr,        nullptr, &m_precomputed, nullptr,      nullptr);
-    fillTable(kInitHeightTable, &m_precomputed, &m_heightFreq,  nullptr, &m_pingpong[0], nullptr,      nullptr);
-    fillTable(kInitGradTable,   &m_precomputed, &m_gradFreq,    nullptr, &m_pingpong[0], nullptr,      nullptr);
-    fillTable(kInitDispTable,   &m_precomputed, &m_dispFreq,    nullptr, &m_pingpong[0], nullptr,      nullptr);
-    fillTable(kIFFT0to1Table,   &m_precomputed, &m_pingpong[0], nullptr, &m_pingpong[1], nullptr,      nullptr);
-    fillTable(kIFFT1to0Table,   &m_precomputed, &m_pingpong[1], nullptr, &m_pingpong[0], nullptr,      nullptr);
-    fillTable(kPermuteHTable,   &m_pingpong[1], nullptr,        nullptr, &m_heightMap,   nullptr,      nullptr);
-    fillTable(kPermuteGTable,   &m_pingpong[1], nullptr,        nullptr, &m_gradMap,     nullptr,      nullptr);
-    fillTable(kPermuteDTable,   &m_pingpong[1], nullptr,        nullptr, &m_dispMap,     nullptr,      nullptr);
+    // Shared tables (reference only precomputed + ping-pong buffers).
+    fillTable(kPrecomputeTable, nullptr,        nullptr,        nullptr, &m_precomputed, nullptr, nullptr);
+    fillTable(kIFFT0to1Table,   &m_precomputed, &m_pingpong[0], nullptr, &m_pingpong[1], nullptr, nullptr);
+    fillTable(kIFFT1to0Table,   &m_precomputed, &m_pingpong[1], nullptr, &m_pingpong[0], nullptr, nullptr);
 
-    // Render table: height/grad/disp SRVs + two per-frame slots (filled in Render()) + env cube.
-    S(&m_heightMap, kRenderTable + 0);
-    S(&m_gradMap,   kRenderTable + 1);
-    S(&m_dispMap,   kRenderTable + 2);
-    CreateNullSRV    (m_device, CpuHandle(kRenderTable + 3));
-    CreateNullSRV    (m_device, CpuHandle(kRenderTable + 4));
-    CreateNullSRVCube(m_device, CpuHandle(kRenderTable + 5));
+    // Per-cascade tables.
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        Cascade& cs = m_cascades[c];
+        UINT base = kCascadeTablesBegin + (UINT)c * kCascadeTableStride;
+        cs.phillipsTable   = base + 0;
+        cs.dynSpecTable    = base + 6;
+        cs.initHeightTable = base + 12;
+        cs.initGradTable   = base + 18;
+        cs.initDispTable   = base + 24;
+        cs.permuteHTable   = base + 30;
+        cs.permuteGTable   = base + 36;
+        cs.permuteDTable   = base + 42;
+
+        fillTable(cs.phillipsTable,   &cs.noise,      nullptr,        nullptr, &cs.h0,        nullptr,     nullptr);
+        fillTable(cs.dynSpecTable,    &cs.h0,         nullptr,        nullptr, &cs.heightFreq,&cs.gradFreq,&cs.dispFreq);
+        fillTable(cs.initHeightTable, &m_precomputed, &cs.heightFreq, nullptr, &m_pingpong[0],nullptr,     nullptr);
+        fillTable(cs.initGradTable,   &m_precomputed, &cs.gradFreq,   nullptr, &m_pingpong[0],nullptr,     nullptr);
+        fillTable(cs.initDispTable,   &m_precomputed, &cs.dispFreq,   nullptr, &m_pingpong[0],nullptr,     nullptr);
+        fillTable(cs.permuteHTable,   &m_pingpong[1], nullptr,        nullptr, &cs.heightMap, nullptr,     nullptr);
+        fillTable(cs.permuteGTable,   &m_pingpong[1], nullptr,        nullptr, &cs.gradMap,   nullptr,     nullptr);
+        fillTable(cs.permuteDTable,   &m_pingpong[1], nullptr,        nullptr, &cs.dispMap,   nullptr,     nullptr);
+    }
+
+    // Render table: cascade maps grouped by type [all height][all grad][all disp],
+    // then two per-frame scene slots (filled in Render()) + reflection cube.
+    for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].heightMap, kRenderTable + 0 * kNumCascades + c);
+    for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].gradMap,   kRenderTable + 1 * kNumCascades + c);
+    for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].dispMap,   kRenderTable + 2 * kNumCascades + c);
+    CreateNullSRV    (m_device, CpuHandle(kRenderSceneDepth));
+    CreateNullSRV    (m_device, CpuHandle(kRenderSceneColor));
+    CreateNullSRVCube(m_device, CpuHandle(kRenderEnvCube));
 }
 
 // ---------------------------------------------------------------------------
@@ -474,43 +510,48 @@ void FFTWaterSurface::GenerateNoise()
     noiseDesc.SampleDesc.Count = 1;
     noiseDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
-    UINT64 uploadSize;
-    m_device->GetCopyableFootprints(&noiseDesc, 0, 1, 0,
-                                    &m_noiseFootprint, nullptr, nullptr, &uploadSize);
-
-    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width            = uploadSize;
-    bd.Height           = bd.DepthOrArraySize = bd.MipLevels = 1;
-    bd.SampleDesc.Count = 1;
-    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ASSERT_SUCCEEDED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
-                                                       D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                       nullptr, IID_PPV_ARGS(&m_noiseUpload)));
-
-    m_noiseCpu.resize((size_t)N * N);
-
-    uint8_t* mapped = nullptr;
-    m_noiseUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
-    srand(12345);
-    for (int y = 0; y < N; ++y)
+    for (int c = 0; c < kNumCascades; ++c)
     {
-        float* row = reinterpret_cast<float*>(
-            mapped + m_noiseFootprint.Offset + (UINT64)y * m_noiseFootprint.Footprint.RowPitch);
-        for (int x = 0; x < N; ++x)
+        Cascade& cs = m_cascades[c];
+
+        UINT64 uploadSize;
+        m_device->GetCopyableFootprints(&noiseDesc, 0, 1, 0,
+                                        &cs.noiseFootprint, nullptr, nullptr, &uploadSize);
+
+        D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width            = uploadSize;
+        bd.Height           = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ASSERT_SUCCEEDED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                           D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                           nullptr, IID_PPV_ARGS(&cs.noiseUpload)));
+
+        cs.noiseCpu.resize((size_t)N * N);
+
+        uint8_t* mapped = nullptr;
+        cs.noiseUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        srand(12345 + c * 7919);  // distinct seed per cascade → decorrelated fields
+        for (int y = 0; y < N; ++y)
         {
-            float u1 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
-            float u2 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
-            float mag = sqrtf(-2.0f * logf(u1));
-            float gx = mag * cosf(6.28318530f * u2);
-            float gy = mag * sinf(6.28318530f * u2);
-            row[x * 2 + 0] = gx;
-            row[x * 2 + 1] = gy;
-            m_noiseCpu[y * N + x] = { gx, gy };
+            float* row = reinterpret_cast<float*>(
+                mapped + cs.noiseFootprint.Offset + (UINT64)y * cs.noiseFootprint.Footprint.RowPitch);
+            for (int x = 0; x < N; ++x)
+            {
+                float u1 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
+                float u2 = (rand() + 1.0f) / (RAND_MAX + 1.0f);
+                float mag = sqrtf(-2.0f * logf(u1));
+                float gx = mag * cosf(6.28318530f * u2);
+                float gy = mag * sinf(6.28318530f * u2);
+                row[x * 2 + 0] = gx;
+                row[x * 2 + 1] = gy;
+                cs.noiseCpu[y * N + x] = { gx, gy };
+            }
         }
+        cs.noiseUpload->Unmap(0, nullptr);
     }
-    m_noiseUpload->Unmap(0, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +670,7 @@ void FFTWaterSurface::LoadEnvironmentMap(ID3D12CommandQueue* queue, const std::s
     srvDesc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.TextureCube.MipLevels     = 1;
     m_device->CreateShaderResourceView(m_envCubeMap.Get(), &srvDesc,
-                                       CpuHandle(kRenderTable + 5));
+                                       CpuHandle(kRenderEnvCube));
 }
 
 void FFTWaterSurface::SetEnvCubemapFromResource(ID3D12Device* device, ID3D12Resource* resource)
@@ -642,7 +683,19 @@ void FFTWaterSurface::SetEnvCubemapFromResource(ID3D12Device* device, ID3D12Reso
     srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURECUBE;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.TextureCube.MipLevels   = 1;
-    device->CreateShaderResourceView(resource, &srvDesc, CpuHandle(kRenderTable + 5));
+    device->CreateShaderResourceView(resource, &srvDesc, CpuHandle(kRenderEnvCube));
+}
+
+void FFTWaterSurface::PrepareForCompute(CommandContext& ctx)
+{
+    const D3D12_RESOURCE_STATES kNpsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        ctx.TransitionResource(m_cascades[c].heightMap, kNpsr);
+        ctx.TransitionResource(m_cascades[c].gradMap,   kNpsr);
+        ctx.TransitionResource(m_cascades[c].dispMap,   kNpsr);
+    }
+    ctx.FlushResourceBarriers();
 }
 
 // ---------------------------------------------------------------------------
@@ -651,14 +704,16 @@ void FFTWaterSurface::SetEnvCubemapFromResource(ID3D12Device* device, ID3D12Reso
 
 void FFTWaterSurface::BuildSpectrumPlot()
 {
-    if (m_noiseCpu.empty())
+    // Plot cascade 0 (the swell cascade). X axis = |k| in grid units for that cascade.
+    const Cascade& cs = m_cascades[0];
+    if (cs.noiseCpu.empty())
         return;
 
     const float Pi    = 3.14159265f;
     const float g     = 9.81f;
     const int   N     = m_desc.N;
     const int   halfN = N / 2;
-    const float DeltaK = 2.0f * Pi / m_desc.TileSize;
+    const float DeltaK = 2.0f * Pi / cs.tileSize;
     const float L        = tweaks.windSpeed * tweaks.windSpeed / g;
     const float windCosT = cosf(tweaks.windTheta);
     const float windSinT = sinf(tweaks.windTheta);
@@ -692,7 +747,7 @@ void FFTWaterSurface::BuildSpectrumPlot()
             int tx = ((nx + halfN) % N + N) % N;
             int tz = ((nz + halfN) % N + N) % N;
 
-            const auto& noise = m_noiseCpu[tz * N + tx];
+            const auto& noise = cs.noiseCpu[tz * N + tx];
             float phiK = sqrtf(phillips(kx, kz) * 0.5f);
             float h0R  = noise.x * phiK;
             float h0I  = noise.y * phiK;
@@ -709,16 +764,11 @@ void FFTWaterSurface::BuildSpectrumPlot()
 
 float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsedTime, int modes) const
 {
-    if (m_noiseCpu.empty())
-        return 0.0f;
-
     const float Pi     = 3.14159265f;
     const float g      = 9.81f;
     const float time   = elapsedTime * tweaks.timeScale + 60.0f;
     const int   N      = m_desc.N;
     const int   halfN  = N / 2;
-    const float DeltaK = 2.0f * Pi / m_desc.TileSize;
-    const float HalfScale = (1.0f / m_desc.TileSize) * 0.5f;
 
     const float L         = tweaks.windSpeed * tweaks.windSpeed / g;
     const float windCosT  = cosf(tweaks.windTheta);
@@ -736,52 +786,63 @@ float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsed
         return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
     };
 
-    float height = 0.0f;
-
-    for (int nz = -modes; nz <= modes; ++nz)
+    // Sum the low-frequency contribution of every cascade (matches the GPU render sum).
+    float totalHeight = 0.0f;
+    for (int c = 0; c < kNumCascades; ++c)
     {
-        for (int nx = -modes; nx <= modes; ++nx)
+        const Cascade& cs = m_cascades[c];
+        if (cs.noiseCpu.empty())
+            continue;
+
+        const float DeltaK    = 2.0f * Pi / cs.tileSize;
+        const float HalfScale = (1.0f / cs.tileSize) * 0.5f;
+
+        float height = 0.0f;
+        for (int nz = -modes; nz <= modes; ++nz)
         {
-            if (nx == 0 && nz == 0) continue;
+            for (int nx = -modes; nx <= modes; ++nx)
+            {
+                if (nx == 0 && nz == 0) continue;
 
-            float kx = nx * DeltaK;
-            float kz = nz * DeltaK;
+                float kx = nx * DeltaK;
+                float kz = nz * DeltaK;
 
-            // Texture indices for k and -k, matching PhillipsSpectrum.hlsl addressing
-            int tx  = ((  nx + halfN) % N + N) % N;
-            int tz  = ((  nz + halfN) % N + N) % N;
-            int mtx = (( -nx + halfN) % N + N) % N;
-            int mtz = (( -nz + halfN) % N + N) % N;
+                // Texture indices for k and -k, matching PhillipsSpectrum.hlsl addressing
+                int tx  = ((  nx + halfN) % N + N) % N;
+                int tz  = ((  nz + halfN) % N + N) % N;
+                int mtx = (( -nx + halfN) % N + N) % N;
+                int mtz = (( -nz + halfN) % N + N) % N;
 
-            XMFLOAT2 noiseK    = m_noiseCpu[tz  * N + tx];
-            XMFLOAT2 noiseMinK = m_noiseCpu[mtz * N + mtx];
+                XMFLOAT2 noiseK    = cs.noiseCpu[tz  * N + tx];
+                XMFLOAT2 noiseMinK = cs.noiseCpu[mtz * N + mtx];
 
-            float phiK    = sqrtf(phillips( kx,  kz) * 0.5f);
-            float phiMinK = sqrtf(phillips(-kx, -kz) * 0.5f);
+                float phiK    = sqrtf(phillips( kx,  kz) * 0.5f);
+                float phiMinK = sqrtf(phillips(-kx, -kz) * 0.5f);
 
-            // h0(k) and conj(h0(-k)) — mirrors PhillipsSpectrum.hlsl
-            float h0Kx  =  noiseK.x    * phiK;
-            float h0Ky  =  noiseK.y    * phiK;
-            float h0mKx =  noiseMinK.x * phiMinK;
-            float h0mKy = -noiseMinK.y * phiMinK; // conjugate
+                // h0(k) and conj(h0(-k)) — mirrors PhillipsSpectrum.hlsl
+                float h0Kx  =  noiseK.x    * phiK;
+                float h0Ky  =  noiseK.y    * phiK;
+                float h0mKx =  noiseMinK.x * phiMinK;
+                float h0mKy = -noiseMinK.y * phiMinK; // conjugate
 
-            // Dispersion: omega = sqrt(|k| * g)
-            float omega = sqrtf(sqrtf(kx*kx + kz*kz) * g);
-            float eRe = cosf(omega * time);
-            float eIm = sinf(omega * time);
+                // Dispersion: omega = sqrt(|k| * g)
+                float omega = sqrtf(sqrtf(kx*kx + kz*kz) * g);
+                float eRe = cosf(omega * time);
+                float eIm = sinf(omega * time);
 
-            // h(k,t) = h0(k)*exp(i*omega*t) + conj(h0(-k))*exp(-i*omega*t)
-            // mirrors DynamicSpectrum.hlsl ComplexMult(h0.xy, E) + ComplexMult(h0.zw, conj(E))
-            float hRe = (h0Kx*eRe - h0Ky*eIm) + (h0mKx*eRe + h0mKy*eIm);
-            float hIm = (h0Kx*eIm + h0Ky*eRe) + (-h0mKx*eIm + h0mKy*eRe);
+                // h(k,t) = h0(k)*exp(i*omega*t) + conj(h0(-k))*exp(-i*omega*t)
+                float hRe = (h0Kx*eRe - h0Ky*eIm) + (h0mKx*eRe + h0mKy*eIm);
+                float hIm = (h0Kx*eIm + h0Ky*eRe) + (-h0mKx*eIm + h0mKy*eRe);
 
-            // Accumulate real part of h(k,t) * exp(i*k·x)
-            float kDotX = kx * worldX + kz * worldZ;
-            height += hRe * cosf(kDotX) - hIm * sinf(kDotX);
+                // Accumulate real part of h(k,t) * exp(i*k·x)
+                float kDotX = kx * worldX + kz * worldZ;
+                height += hRe * cosf(kDotX) - hIm * sinf(kDotX);
+            }
         }
+        totalHeight += height * HalfScale;
     }
 
-    return height * HalfScale;
+    return totalHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -910,44 +971,7 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
 
     ctx.SetDescriptorHeap(m_heap.Get());
 
-    // ---- Phillips spectrum — re-run whenever spectral parameters change ----
-    // Noise is already in NON_PIXEL_SHADER_RESOURCE state (uploaded synchronously in Init).
-    {
-        PhillipsParams currentParams = { tweaks.windTheta, tweaks.windSpeed,
-                                         tweaks.smallWaveCutoff, tweaks.amplitude };
-        if (!m_phillipsValid || !(currentParams == m_lastPhillipsParams))
-        {
-            // h0 starts as UAV on first frame; on re-runs it's NPSR — transition back to UAV.
-            ctx.TransitionResource(m_h0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude; };
-            auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
-            FFTParameters fftParams = { (uint32_t)N, m_desc.TileSize, 1.0f / m_desc.TileSize };
-            memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
-
-            auto globAlloc = alloc.Allocate(sizeof(PhillipsGlobals));
-            PhillipsGlobals globals = { tweaks.windTheta, tweaks.windSpeed,
-                                        tweaks.smallWaveCutoff, tweaks.amplitude };
-            memcpy(globAlloc.cpuAddress, &globals, sizeof(globals));
-
-            cmd->SetComputeRootSignature(m_computeRootSig.Get());
-            ctx.SetPipelineState(PhillipsSpectrumPSO.Get());
-            cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
-            cmd->SetComputeRootConstantBufferView(1, globAlloc.gpuAddress);
-            ctx.FlushResourceBarriers();
-            cmd->SetComputeRootDescriptorTable(2, GpuHandle(kPhillipsTable));
-            cmd->Dispatch(groupsN, groupsN, 1);
-
-            ctx.UAVBarrier(m_h0);
-            ctx.TransitionResource(m_h0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-            m_lastPhillipsParams = currentParams;
-            m_phillipsValid      = true;
-            BuildSpectrumPlot();
-        }
-    }
-
-    // ---- Twiddle factors — one-time precomputation (depends only on N) ----
+    // ---- Twiddle factors — one-time precomputation (depends only on N; shared) ----
     if (!m_precomputeDone)
     {
         auto fftAlloc   = alloc.Allocate(sizeof(FFTParameters));
@@ -969,23 +993,76 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
         m_precomputeDone = true;
     }
 
-    // ---- Transition final maps back to UAV for this frame's writes ----
-    // TransitionResource is a no-op if state is already UNORDERED_ACCESS (first frame),
-    // so no separate firstFrame flag is needed.
-    ctx.TransitionResource(m_heightMap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ctx.TransitionResource(m_gradMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ctx.TransitionResource(m_dispMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // Common simulation clock shared by all cascades.
+    float simTime = time * tweaks.timeScale + 60.0f;
+
+    for (int c = 0; c < kNumCascades; ++c)
+        RunCascadeFFT(ctx, alloc, m_cascades[c], simTime);
+
+    ctx.FlushResourceBarriers();
+}
+
+// Phillips + DynamicSpectrum + IFFT + Permute for a single cascade. The ping-pong and
+// twiddle buffers are shared and reused serially, so cascades must run sequentially.
+void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
+                                    Cascade& cs, float simTime)
+{
+    auto* cmd = ctx.GetCommandList();
+    int N = m_desc.N;
+    UINT groupsN = (UINT)(N / 8);
+
+    const FFTParameters fftParams = { (uint32_t)N, cs.tileSize, 1.0f / cs.tileSize };
+
+    // ---- Phillips spectrum — re-run whenever spectral parameters change ----
+    // Noise is already in NON_PIXEL_SHADER_RESOURCE state (uploaded synchronously in Init).
+    {
+        PhillipsParams currentParams = { tweaks.windTheta, tweaks.windSpeed,
+                                         tweaks.smallWaveCutoff, tweaks.amplitude };
+        if (!cs.phillipsValid || !(currentParams == cs.lastPhillipsParams))
+        {
+            // h0 starts as UAV on first frame; on re-runs it's NPSR — transition back to UAV.
+            ctx.TransitionResource(cs.h0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude; };
+            auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
+            memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
+
+            auto globAlloc = alloc.Allocate(sizeof(PhillipsGlobals));
+            PhillipsGlobals globals = { tweaks.windTheta, tweaks.windSpeed,
+                                        tweaks.smallWaveCutoff, tweaks.amplitude };
+            memcpy(globAlloc.cpuAddress, &globals, sizeof(globals));
+
+            cmd->SetComputeRootSignature(m_computeRootSig.Get());
+            ctx.SetPipelineState(PhillipsSpectrumPSO.Get());
+            cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
+            cmd->SetComputeRootConstantBufferView(1, globAlloc.gpuAddress);
+            ctx.FlushResourceBarriers();
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle(cs.phillipsTable));
+            cmd->Dispatch(groupsN, groupsN, 1);
+
+            ctx.UAVBarrier(cs.h0);
+            ctx.TransitionResource(cs.h0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            cs.lastPhillipsParams = currentParams;
+            cs.phillipsValid      = true;
+            if (&cs == &m_cascades[0])
+                BuildSpectrumPlot();  // plot the swell cascade
+        }
+    }
+
+    // ---- Transition this cascade's final maps to UAV for this frame's writes ----
+    ctx.TransitionResource(cs.heightMap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ctx.TransitionResource(cs.gradMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ctx.TransitionResource(cs.dispMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // ---- Dynamic spectrum (per-frame) ----
     {
         auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
-        FFTParameters fftParams = { (uint32_t)N, m_desc.TileSize, 1.0f / m_desc.TileSize };
         memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
 
         auto timeAlloc = alloc.Allocate(256);
-        time = time * tweaks.timeScale + 60.0f;
         struct DynSpecGlobals { float SimulationTime; float Choppiness; };
-        DynSpecGlobals dynGlobals = { time, tweaks.choppiness };
+        DynSpecGlobals dynGlobals = { simTime, tweaks.choppiness };
         memcpy(timeAlloc.cpuAddress, &dynGlobals, sizeof(dynGlobals));
 
         cmd->SetComputeRootSignature(m_computeRootSig.Get());
@@ -993,20 +1070,20 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
         cmd->SetComputeRootConstantBufferView(0, fftAlloc.gpuAddress);
         cmd->SetComputeRootConstantBufferView(1, timeAlloc.gpuAddress);
         ctx.FlushResourceBarriers();
-        cmd->SetComputeRootDescriptorTable(2, GpuHandle(kDynSpecTable));
+        cmd->SetComputeRootDescriptorTable(2, GpuHandle(cs.dynSpecTable));
         cmd->Dispatch(groupsN, groupsN, 1);
     }
 
-    ctx.UAVBarrier(m_heightFreq);
-    ctx.UAVBarrier(m_gradFreq);
-    ctx.UAVBarrier(m_dispFreq);
+    ctx.UAVBarrier(cs.heightFreq);
+    ctx.UAVBarrier(cs.gradFreq);
+    ctx.UAVBarrier(cs.dispFreq);
 
     // ---- IFFT + Permute for each channel ----
     struct ChannelDesc { UINT initTable; PixelBuffer* srcFreq; UINT permuteTable; PixelBuffer* finalMap; };
     ChannelDesc channels[3] = {
-        { kInitHeightTable, &m_heightFreq, kPermuteHTable, &m_heightMap },
-        { kInitGradTable,   &m_gradFreq,   kPermuteGTable, &m_gradMap   },
-        { kInitDispTable,   &m_dispFreq,   kPermuteDTable, &m_dispMap   },
+        { cs.initHeightTable, &cs.heightFreq, cs.permuteHTable, &cs.heightMap },
+        { cs.initGradTable,   &cs.gradFreq,   cs.permuteGTable, &cs.gradMap   },
+        { cs.initDispTable,   &cs.dispFreq,   cs.permuteDTable, &cs.dispMap   },
     };
 
     for (auto& ch : channels)
@@ -1091,15 +1168,12 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
         ctx.TransitionResource(*ch.srcFreq,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
-    // ---- Transition final maps to SRV for Render ----
-    // Include NON_PIXEL_SHADER_RESOURCE so the non-tess VS can also read them.
-    const D3D12_RESOURCE_STATES kSrvAll =
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    ctx.TransitionResource(m_heightMap, kSrvAll);
-    ctx.TransitionResource(m_gradMap,   kSrvAll);
-    ctx.TransitionResource(m_dispMap,   kSrvAll);
-    ctx.FlushResourceBarriers();
+    // ---- Transition final maps to NPSR for cross-queue handoff ----
+    // PIXEL_SHADER_RESOURCE is invalid on compute queues; Render() adds the PSR bit
+    // on the graphics queue before drawing.
+    ctx.TransitionResource(cs.heightMap, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ctx.TransitionResource(cs.gradMap,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ctx.TransitionResource(cs.dispMap,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,9 +1185,22 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
                              D3D12_CPU_DESCRIPTOR_HANDLE sceneDepthSRV,
                              D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSRV)
 {
-    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderTable + 3), sceneDepthSRV,
+    // Promote displacement maps from NPSR (written on compute queue) to PSR|NPSR
+    // so both the domain shader and pixel shader can read them.
+    const D3D12_RESOURCE_STATES kSrvAll =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        ctx.TransitionResource(m_cascades[c].heightMap, kSrvAll);
+        ctx.TransitionResource(m_cascades[c].gradMap,   kSrvAll);
+        ctx.TransitionResource(m_cascades[c].dispMap,   kSrvAll);
+    }
+    ctx.FlushResourceBarriers();
+
+    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderSceneDepth), sceneDepthSRV,
                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderTable + 4), sceneColorSRV,
+    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderSceneColor), sceneColorSRV,
                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     ctx.SetDescriptorHeap(m_heap.Get());
@@ -1136,14 +1223,16 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
     // Build a template WaterConstants with fields that are the same for every tile.
     WaterConstants wcBase = {};
     wcBase.WorldViewProjMat = view.viewProjMatrix; // plain ViewProj; WorldMat carries tile offset
-    wcBase.Color            = tweaks.color;
-    wcBase.TileSize         = m_desc.TileSize;
-    wcBase.RcpTileSize      = 1.0f / m_desc.TileSize;
-    wcBase.MaxTessellation  = tweaks.maxTessellation;
-    wcBase.TessDistance     = tweaks.tessDistance;
+    wcBase.ColorMax = XMFLOAT4(tweaks.color.x, tweaks.color.y, tweaks.color.z,
+                               tweaks.maxTessellation);
+    // CascTess.xyz = 1/tileSize per cascade (drives sample UV + amplitude scale); w = tess distance.
+    wcBase.CascTess = XMFLOAT4(1.0f / m_cascades[0].tileSize,
+                               kNumCascades > 1 ? 1.0f / m_cascades[1].tileSize : 0.0f,
+                               kNumCascades > 2 ? 1.0f / m_cascades[2].tileSize : 0.0f,
+                               tweaks.tessDistance);
 
     ctx.SetDescriptorTable(2, GpuHandle(kRenderTable));
-    ctx.SetDescriptorTable(3, GpuHandle(kRenderTable + 3));
+    ctx.SetDescriptorTable(3, GpuHandle(kRenderSceneDepth));
 
     ctx.SetVertexBuffer(m_meshVertex.GetView());
     if (tweaks.tessellation)

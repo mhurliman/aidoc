@@ -23,6 +23,10 @@ public:
     D3D12_RESOURCE_STATES GetCurrentState() const { return m_currentState; }
     void SetCurrentState(D3D12_RESOURCE_STATES state) { m_currentState = state; }
 
+    // Release the underlying resource (e.g. before IDXGISwapChain::ResizeBuffers, which
+    // requires all back-buffer references to be dropped).
+    void Reset() { m_resource.Reset(); }
+
     void SetDebugName(const wchar_t* name) { if (m_resource) m_resource->SetName(name); }
 
 protected:
