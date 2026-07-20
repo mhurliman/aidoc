@@ -40,6 +40,13 @@ public:
     // Parse glTF and create child Texture/Material resources via the ResourceManager.
     void LoadFromGltf(const std::string& path, ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ResourceManager& resMgr);
 
+    // Build a single-submesh mesh directly from interleaved-free position/normal arrays (3 floats
+    // each per vertex) and an index array, using the supplied material. No SCENE_SCALE is applied —
+    // positions are used as-is (e.g. the sim hull mesh, already in metres). Used by the boat.
+    void CreateFromArrays(const float* positions, const float* normals, uint32_t vertexCount,
+                          const uint32_t* indices, uint32_t indexCount,
+                          std::shared_ptr<Material> material, ID3D12Device* device);
+
     D3D12_VERTEX_BUFFER_VIEW GetVertexBufferView() const { return m_vbv; }
     D3D12_INDEX_BUFFER_VIEW GetIndexBufferView() const { return m_ibv; }
 

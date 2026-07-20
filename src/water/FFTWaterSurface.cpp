@@ -845,6 +845,198 @@ float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsed
     return totalHeight;
 }
 
+void FFTWaterSurface::SampleHeightGrid(float originX, float originZ, float cell, int G,
+                                       float elapsedTime, int modes, float* outH) const
+{
+    const float Pi     = 3.14159265f;
+    const float g      = 9.81f;
+    const float time   = elapsedTime * tweaks.timeScale + 60.0f;
+    const int   N      = m_desc.N;
+    const int   halfN  = N / 2;
+
+    const float L         = tweaks.windSpeed * tweaks.windSpeed / g;
+    const float windCosT  = cosf(tweaks.windTheta);
+    const float windSinT  = sinf(tweaks.windTheta);
+
+    // Phillips(k) — identical to SampleHeightCPU / PhillipsSpectrum.hlsl.
+    auto phillips = [&](float kx, float kz) -> float
+    {
+        float k2 = kx * kx + kz * kz;
+        if (k2 < 1e-8f) return 0.0f;
+        float kLen = sqrtf(k2);
+        float kL2  = k2 * L * L;
+        float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
+        float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
+        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+    };
+
+    const int GG = G * G;
+    for (int i = 0; i < GG; ++i) outH[i] = 0.0f;
+
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        const Cascade& cs = m_cascades[c];
+        if (cs.noiseCpu.empty()) continue;
+
+        const float DeltaK    = 2.0f * Pi / cs.tileSize;
+        const float HalfScale = (1.0f / cs.tileSize) * 0.5f;   // height: HeightMap * (rcp*0.5)
+
+        for (int nz = -modes; nz <= modes; ++nz)
+            for (int nx = -modes; nx <= modes; ++nx)
+            {
+                if (nx == 0 && nz == 0) continue;
+
+                float kx = nx * DeltaK;
+                float kz = nz * DeltaK;
+
+                int tx  = ((  nx + halfN) % N + N) % N;
+                int tz  = ((  nz + halfN) % N + N) % N;
+                int mtx = (( -nx + halfN) % N + N) % N;
+                int mtz = (( -nz + halfN) % N + N) % N;
+                XMFLOAT2 noiseK    = cs.noiseCpu[tz  * N + tx];
+                XMFLOAT2 noiseMinK = cs.noiseCpu[mtz * N + mtx];
+
+                float phiK    = sqrtf(phillips( kx,  kz) * 0.5f);
+                float phiMinK = sqrtf(phillips(-kx, -kz) * 0.5f);
+                float h0Kx  =  noiseK.x    * phiK;
+                float h0Ky  =  noiseK.y    * phiK;
+                float h0mKx =  noiseMinK.x * phiMinK;
+                float h0mKy = -noiseMinK.y * phiMinK; // conjugate
+
+                float omega = sqrtf(sqrtf(kx*kx + kz*kz) * g);
+                float eRe = cosf(omega * time);
+                float eIm = sinf(omega * time);
+
+                // Raw complex height amplitude h(k,t).
+                float hRe = (h0Kx*eRe - h0Ky*eIm) + (h0mKx*eRe + h0mKy*eIm);
+                float hIm = (h0Kx*eIm + h0Ky*eRe) + (-h0mKx*eIm + h0mKy*eRe);
+                // Height contribution factors: Re(h·e^{ikx}) = hRe·re - hIm·im.
+                float hReS = hRe * HalfScale, hImS = hIm * HalfScale;
+
+                // March e^{i k·x} across the regular grid by fixed per-column/row complex rotor.
+                float cx = cosf(kx * cell), sx = sinf(kx * cell);
+                float cz = cosf(kz * cell), sz = sinf(kz * cell);
+                float base = kx * originX + kz * originZ;
+                float rowRe = cosf(base), rowIm = sinf(base);
+                for (int j = 0; j < G; ++j)
+                {
+                    float re = rowRe, im = rowIm;
+                    int rowBase = j * G;
+                    for (int i = 0; i < G; ++i)
+                    {
+                        outH[rowBase + i] += hReS * re - hImS * im;   // Re(h · e^{i k·x})
+                        float nre = re * cx - im * sx;
+                        im = re * sx + im * cx;
+                        re = nre;
+                    }
+                    float nrre = rowRe * cz - rowIm * sz;
+                    rowIm = rowRe * sz + rowIm * cz;
+                    rowRe = nrre;
+                }
+            }
+    }
+}
+
+void FFTWaterSurface::SampleSurfaceGrid(float originX, float originZ, float cell, int G,
+                                        float elapsedTime, int modes,
+                                        float* outH, float* outDx, float* outDz) const
+{
+    const float Pi     = 3.14159265f;
+    const float g      = 9.81f;
+    const float time   = elapsedTime * tweaks.timeScale + 60.0f;
+    const int   N      = m_desc.N;
+    const int   halfN  = N / 2;
+    const float chop   = tweaks.choppiness;
+
+    const float L         = tweaks.windSpeed * tweaks.windSpeed / g;
+    const float windCosT  = cosf(tweaks.windTheta);
+    const float windSinT  = sinf(tweaks.windTheta);
+
+    auto phillips = [&](float kx, float kz) -> float
+    {
+        float k2 = kx * kx + kz * kz;
+        if (k2 < 1e-8f) return 0.0f;
+        float kLen = sqrtf(k2);
+        float kL2  = k2 * L * L;
+        float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
+        float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
+        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+    };
+
+    const int GG = G * G;
+    for (int i = 0; i < GG; ++i) { outH[i] = 0.0f; outDx[i] = 0.0f; outDz[i] = 0.0f; }
+
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        const Cascade& cs = m_cascades[c];
+        if (cs.noiseCpu.empty()) continue;
+
+        const float DeltaK    = 2.0f * Pi / cs.tileSize;
+        const float HalfScale = (1.0f / cs.tileSize) * 0.5f;   // height:  HeightMap * (rcp*0.5)
+        const float DispScale = (1.0f / cs.tileSize);          // disp:    DisplacementMap * rcp
+
+        for (int nz = -modes; nz <= modes; ++nz)
+            for (int nx = -modes; nx <= modes; ++nx)
+            {
+                if (nx == 0 && nz == 0) continue;
+
+                float kx = nx * DeltaK;
+                float kz = nz * DeltaK;
+                float kLen = sqrtf(kx*kx + kz*kz);
+
+                int tx  = ((  nx + halfN) % N + N) % N;
+                int tz  = ((  nz + halfN) % N + N) % N;
+                int mtx = (( -nx + halfN) % N + N) % N;
+                int mtz = (( -nz + halfN) % N + N) % N;
+                XMFLOAT2 noiseK    = cs.noiseCpu[tz  * N + tx];
+                XMFLOAT2 noiseMinK = cs.noiseCpu[mtz * N + mtx];
+
+                float phiK    = sqrtf(phillips( kx,  kz) * 0.5f);
+                float phiMinK = sqrtf(phillips(-kx, -kz) * 0.5f);
+                float h0Kx  =  noiseK.x    * phiK;
+                float h0Ky  =  noiseK.y    * phiK;
+                float h0mKx =  noiseMinK.x * phiMinK;
+                float h0mKy = -noiseMinK.y * phiMinK;
+
+                float omega = sqrtf(kLen * g);
+                float eRe = cosf(omega * time);
+                float eIm = sinf(omega * time);
+
+                float hRe = (h0Kx*eRe - h0Ky*eIm) + (h0mKx*eRe + h0mKy*eIm);
+                float hIm = (h0Kx*eIm + h0Ky*eRe) + (-h0mKx*eIm + h0mKy*eRe);
+                float hReS = hRe * HalfScale, hImS = hIm * HalfScale;
+                // Displacement: GPU packs Offset = choppiness·i·k·h/|k| (complex), IFFTs it, so
+                // Dx = Re(Σ Offset·e^{ikx}), Dz = Im(...). Offset = (A + iB), matching
+                // DynamicSpectrum.hlsl's ComplexMult(k, i·h):
+                float dK = DispScale * chop / kLen;
+                float A  = dK * (-kx * hIm - kz * hRe);
+                float B  = dK * ( kx * hRe - kz * hIm);
+
+                float cx = cosf(kx * cell), sx = sinf(kx * cell);
+                float cz = cosf(kz * cell), sz = sinf(kz * cell);
+                float base = kx * originX + kz * originZ;
+                float rowRe = cosf(base), rowIm = sinf(base);
+                for (int j = 0; j < G; ++j)
+                {
+                    float re = rowRe, im = rowIm;
+                    int rowBase = j * G;
+                    for (int i = 0; i < G; ++i)
+                    {
+                        outH[rowBase + i]  += hReS * re - hImS * im;   // Re(h · e^{i k·x})
+                        outDx[rowBase + i] += A * re - B * im;         // Re(Offset · e^{i k·x})
+                        outDz[rowBase + i] += A * im + B * re;         // Im(Offset · e^{i k·x})
+                        float nre = re * cx - im * sx;
+                        im = re * sx + im * cx;
+                        re = nre;
+                    }
+                    float nrre = rowRe * cz - rowIm * sz;
+                    rowIm = rowRe * sz + rowIm * cz;
+                    rowRe = nrre;
+                }
+            }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CpuHeightfield — pyramid build, bilinear sample, hierarchical range query
 // ---------------------------------------------------------------------------
@@ -1183,7 +1375,9 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
 void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const View& view,
                              const XMFLOAT3& lightDir,
                              D3D12_CPU_DESCRIPTOR_HANDLE sceneDepthSRV,
-                             D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSRV)
+                             D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSRV,
+                             D3D12_CPU_DESCRIPTOR_HANDLE shadowArraySRV,
+                             D3D12_GPU_VIRTUAL_ADDRESS   shadowCascadeCB)
 {
     // Promote displacement maps from NPSR (written on compute queue) to PSR|NPSR
     // so both the domain shader and pixel shader can read them.
@@ -1201,6 +1395,8 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
     m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderSceneDepth), sceneDepthSRV,
                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderSceneColor), sceneColorSRV,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    m_device->CopyDescriptorsSimple(1, CpuHandle(kRenderShadow), shadowArraySRV,
                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     ctx.SetDescriptorHeap(m_heap.Get());
@@ -1233,6 +1429,7 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
 
     ctx.SetDescriptorTable(2, GpuHandle(kRenderTable));
     ctx.SetDescriptorTable(3, GpuHandle(kRenderSceneDepth));
+    ctx.SetConstantBufferView(4, shadowCascadeCB);   // shadow cascade matrices (b2)
 
     ctx.SetVertexBuffer(m_meshVertex.GetView());
     if (tweaks.tessellation)

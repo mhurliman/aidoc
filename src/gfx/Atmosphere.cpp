@@ -1,5 +1,6 @@
 #include "Atmosphere.h"
 #include "util/Assert.h"
+#include <algorithm>
 #include <fstream>
 #include <vector>
 #include <DirectXMath.h>
@@ -308,7 +309,7 @@ void Atmosphere::Update(CommandContext& ctx, LinearAllocator& alloc,
     // ---- SkyViewLUT (every frame) ----
     {
         float altKm = cameraAltitudeM / 1000.0f;
-        float r     = params.bottomRadius + max(0.0f, altKm);
+        float r     = params.bottomRadius + std::max(0.0f, altKm);
 
         GpuSkyViewConstants sv;
         sv.CameraPositionAtm = XMFLOAT3(0.0f, r, 0.0f);
@@ -339,7 +340,7 @@ void Atmosphere::Update(CommandContext& ctx, LinearAllocator& alloc,
 
     // ---- Env cubemap (every frame, samples the freshly-computed SkyViewLUT) ----
     {
-        float altKm = max(0.0f, cameraAltitudeM / 1000.0f);
+        float altKm = std::max(0.0f, cameraAltitudeM / 1000.0f);
         float r     = params.bottomRadius + altKm;
 
         // Transition cubemap to UAV for writing (PSR on all frames after the first).
@@ -483,7 +484,7 @@ void Atmosphere::Render(GraphicsContext& ctx, LinearAllocator& alloc, const View
     XMVECTOR det;
     invVP = XMMatrixTranspose(XMMatrixInverse(&det, vpRowMajor));
 
-    float altKm = max(0.0f, view.position.y / 1000.0f);
+    float altKm = std::max(0.0f, view.position.y / 1000.0f);
     float r     = params.bottomRadius + altKm;
 
     GpuSkyRenderConstants rc;

@@ -83,6 +83,41 @@ void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameC
 
     m_rootSignature = LoadRootSignature(device, "pbr_rs.cso");
     InitShaders();
+    InitShadow();
+}
+
+void Renderer::InitShadow()
+{
+    m_shadowMap.Init(m_device, 2048);
+
+    // The shadow root signature is embedded in the depth VS ([RootSignature] attribute).
+    auto vs = ReadBlobFile(ResolveShaderPath("ShadowDepth_vs.cso"));
+    ASSERT_SUCCEEDED(m_device->CreateRootSignature(0, vs.data(), vs.size(),
+                                                   IID_PPV_ARGS(&m_shadowRootSig)));
+
+    D3D12_INPUT_ELEMENT_DESC layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.InputLayout = {layout, 1};
+    pso.pRootSignature = m_shadowRootSig.Get();
+    pso.VS = {vs.data(), vs.size()};   // no PS — depth only
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;   // casters incl. the double-sided sail
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.RasterizerState.DepthBias = 3000;                  // constant + slope bias fights shadow acne
+    pso.RasterizerState.SlopeScaledDepthBias = 2.5f;
+    pso.DepthStencilState.DepthEnable = TRUE;
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pso.SampleMask = 0xFFFFFFFFu;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 0;
+    pso.SampleDesc.Count = 1;
+    ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_shadowPSO)));
 }
 
 void Renderer::Shutdown()
@@ -108,6 +143,8 @@ void Renderer::BeginFrame(ID3D12CommandAllocator* allocator, ColorBuffer& rt, De
 
     m_currentRT = &rt;
     m_currentDS = &ds;
+    m_mainViewport = viewport;
+    m_mainScissor  = scissor;
 
     if (!m_sceneTargetsInitialized)
     {
@@ -185,6 +222,74 @@ void Renderer::RenderScene(Scene& scene, const View& view,
 
     auto* cmd = m_gfxContext.GetCommandList();
 
+    // --- Shadow setup (CPU): fit the cascades to the camera frustum toward the sun. ---
+    DirectX::XMFLOAT3 sunTravel = { 0.0f, -1.0f, 0.2f };
+    if (!scene.GetDirectionalLights().empty())
+        sunTravel = scene.GetDirectionalLights()[0].direction;
+    m_shadowMap.ComputeCascades(view, sunTravel);
+
+    // Upload the dynamic rig geometry once; the shadow pass and the main/transparent passes share it.
+    const DynamicMesh& rig = scene.GetRig();
+    D3D12_VERTEX_BUFFER_VIEW  rigVBV = {};
+    D3D12_INDEX_BUFFER_VIEW   rigIBV = {};
+    D3D12_GPU_VIRTUAL_ADDRESS rigObjCbv = 0;
+    const bool rigValid = rig.visible && !rig.vertices.empty() && !rig.indices.empty();
+    bool rigHasTransparent = false;
+    if (rigValid)
+    {
+        size_t vbSize = rig.vertices.size() * sizeof(PbrVertex);
+        size_t ibSize = rig.indices.size() * sizeof(uint32_t);
+        auto vbAlloc = m_linearAllocator.Allocate(vbSize);
+        memcpy(vbAlloc.cpuAddress, rig.vertices.data(), vbSize);
+        auto ibAlloc = m_linearAllocator.Allocate(ibSize);
+        memcpy(ibAlloc.cpuAddress, rig.indices.data(), ibSize);
+        rigVBV = { vbAlloc.gpuAddress, (UINT)vbSize, (UINT)sizeof(PbrVertex) };
+        rigIBV = { ibAlloc.gpuAddress, (UINT)ibSize, DXGI_FORMAT_R32_UINT };
+        DirectX::XMFLOAT4X4 ident;
+        DirectX::XMStoreFloat4x4(&ident, DirectX::XMMatrixIdentity());
+        auto objAlloc = m_linearAllocator.Allocate(sizeof(ident));
+        memcpy(objAlloc.cpuAddress, &ident, sizeof(ident));
+        rigObjCbv = objAlloc.gpuAddress;
+    }
+
+    // Upload the debug wave-sample overlay (world-space markers) the same way; own identity CBV.
+    const DynamicMesh& dbg = scene.GetDebug();
+    D3D12_VERTEX_BUFFER_VIEW  dbgVBV = {};
+    D3D12_INDEX_BUFFER_VIEW   dbgIBV = {};
+    D3D12_GPU_VIRTUAL_ADDRESS dbgObjCbv = 0;
+    const bool dbgValid = dbg.visible && !dbg.vertices.empty() && !dbg.indices.empty();
+    if (dbgValid)
+    {
+        size_t vbSize = dbg.vertices.size() * sizeof(PbrVertex);
+        size_t ibSize = dbg.indices.size() * sizeof(uint32_t);
+        auto vbAlloc = m_linearAllocator.Allocate(vbSize);
+        memcpy(vbAlloc.cpuAddress, dbg.vertices.data(), vbSize);
+        auto ibAlloc = m_linearAllocator.Allocate(ibSize);
+        memcpy(ibAlloc.cpuAddress, dbg.indices.data(), ibSize);
+        dbgVBV = { vbAlloc.gpuAddress, (UINT)vbSize, (UINT)sizeof(PbrVertex) };
+        dbgIBV = { ibAlloc.gpuAddress, (UINT)ibSize, DXGI_FORMAT_R32_UINT };
+        DirectX::XMFLOAT4X4 ident;
+        DirectX::XMStoreFloat4x4(&ident, DirectX::XMMatrixIdentity());
+        auto objAlloc = m_linearAllocator.Allocate(sizeof(ident));
+        memcpy(objAlloc.cpuAddress, &ident, sizeof(ident));
+        dbgObjCbv = objAlloc.gpuAddress;
+    }
+
+    // Shadow constants (cascade matrices + sampling params), bound to every lit draw.
+    struct ShadowCB
+    {
+        DirectX::XMFLOAT4X4 cascadeVP[ShadowMap::kCascades];
+        DirectX::XMFLOAT4   params;   // texelSize, depthBias, cascadeCount, enabled
+    };
+    ShadowCB scb = {};
+    for (int c = 0; c < ShadowMap::kCascades; ++c)
+        scb.cascadeVP[c] = m_shadowMap.CascadeViewProjT()[c];
+    scb.params = { 1.0f / static_cast<float>(m_shadowMap.GetResolution()), 0.0018f,
+                   static_cast<float>(ShadowMap::kCascades), 1.0f };
+    auto shadowCbAlloc = m_linearAllocator.Allocate(sizeof(scb));
+    memcpy(shadowCbAlloc.cpuAddress, &scb, sizeof(scb));
+    D3D12_GPU_VIRTUAL_ADDRESS shadowCbAddr = shadowCbAlloc.gpuAddress;
+
     // -------------------------------------------------------------------------
     // Async compute phase — atmosphere LUTs + water FFT on the compute queue.
     // The graphics queue issues a GPU-side Wait after this block so it won't
@@ -215,6 +320,16 @@ void Renderer::RenderScene(Scene& scene, const View& view,
     m_graphicsQueue->Wait(m_computeFence.Get(), computeVal);
 
     // -------------------------------------------------------------------------
+    // Shadow depth pass — render casters (hull + rig) into every cascade.
+    // -------------------------------------------------------------------------
+    RenderShadowPass(scene, view, rigVBV, rigIBV, rigValid);
+    // Restore the main render target/viewport/heap/root sig after the shadow pass.
+    m_gfxContext.SetRenderTarget(*m_currentRT, *m_currentDS);
+    m_gfxContext.SetViewportAndScissor(m_mainViewport, m_mainScissor);
+    m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
+    m_gfxContext.SetRootSignature(m_rootSignature.Get());
+
+    // -------------------------------------------------------------------------
     // Graphics phase — sky, opaque meshes, water render.
     // -------------------------------------------------------------------------
 
@@ -235,6 +350,12 @@ void Renderer::RenderScene(Scene& scene, const View& view,
     if (!gpuLights.empty())
         m_gfxContext.SetShaderResourceView(3, lightsAlloc.gpuAddress);
 
+    // Bind cascaded-shadow resources (persist across the lit draws with this root sig).
+    D3D12_CPU_DESCRIPTOR_HANDLE shadowSrvCpu = m_shadowMap.GetArraySRV();
+    D3D12_GPU_DESCRIPTOR_HANDLE shadowSrvGpu = m_transientHeap.CopyDescriptors(m_device, &shadowSrvCpu, 1);
+    m_gfxContext.SetConstantBufferView(5, shadowCbAddr);
+    m_gfxContext.SetDescriptorTable(6, shadowSrvGpu);
+
     m_gfxContext.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     m_profiler.BeginScope("Opaque Meshes", cmd);
@@ -243,6 +364,18 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         if (!entity.visible)
             continue;
         const auto& mesh = entity.mesh;
+
+        // Per-object world transform at root param 4 (b2). Transposed on upload to match the
+        // viewProj convention (HLSL reads column-major; our matrices are DirectXMath row-major).
+        {
+            DirectX::XMMATRIX worldMat = DirectX::XMLoadFloat4x4(&entity.worldTransform);
+            DirectX::XMFLOAT4X4 worldGpu;
+            DirectX::XMStoreFloat4x4(&worldGpu, DirectX::XMMatrixTranspose(worldMat));
+            auto objAlloc = m_linearAllocator.Allocate(sizeof(worldGpu));
+            memcpy(objAlloc.cpuAddress, &worldGpu, sizeof(worldGpu));
+            m_gfxContext.SetConstantBufferView(4, objAlloc.gpuAddress);
+        }
+
         m_gfxContext.SetVertexBuffer(mesh->GetVertexBufferView());
         m_gfxContext.SetIndexBuffer(mesh->GetIndexBufferView());
 
@@ -252,6 +385,35 @@ void Renderer::RenderScene(Scene& scene, const View& view,
             auto& mat = materials[sub.materialIndex];
             mat->Bind(m_gfxContext, m_linearAllocator, m_transientHeap, m_device, m_nullSrvHandle);
             m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, sub.baseVertex, 0);
+        }
+    }
+
+    // Opaque rig submeshes (spars/lines/foils) using the hoisted rig buffers; the alpha-blended sail
+    // is deferred to the transparent pass after the water.
+    if (rigValid)
+    {
+        m_gfxContext.SetVertexBuffer(rigVBV);
+        m_gfxContext.SetIndexBuffer(rigIBV);
+        m_gfxContext.SetConstantBufferView(4, rigObjCbv);
+        for (const auto& sub : rig.submeshes)
+        {
+            if (sub.material->alphaBlend) { rigHasTransparent = true; continue; }  // deferred
+            sub.material->Bind(m_gfxContext, m_linearAllocator, m_transientHeap, m_device, m_nullSrvHandle);
+            m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, 0, 0);
+        }
+    }
+
+    // Debug wave-sample overlay (opaque, world-space verts → identity object matrix). Drawn before
+    // the water so the depth test lets the water occlude tiles that sit below its surface.
+    if (dbgValid)
+    {
+        m_gfxContext.SetVertexBuffer(dbgVBV);
+        m_gfxContext.SetIndexBuffer(dbgIBV);
+        m_gfxContext.SetConstantBufferView(4, dbgObjCbv);
+        for (const auto& sub : dbg.submeshes)
+        {
+            sub.material->Bind(m_gfxContext, m_linearAllocator, m_transientHeap, m_device, m_nullSrvHandle);
+            m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, 0, 0);
         }
     }
     m_profiler.EndScope(cmd);
@@ -279,7 +441,8 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         m_gfxContext.FlushResourceBarriers();
 
         water.Render(m_gfxContext, m_linearAllocator, view, lightDir,
-                     m_currentDS->GetSRV(), m_sceneColorSRVHandle);
+                     m_currentDS->GetSRV(), m_sceneColorSRVHandle,
+                     m_shadowMap.GetArraySRV(), shadowCbAddr);
 
         m_gfxContext.TransitionResource(*m_currentDS, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         m_profiler.EndScope(cmd);
@@ -289,10 +452,108 @@ void Renderer::RenderScene(Scene& scene, const View& view,
         m_gfxContext.SetRootSignature(m_rootSignature.Get());
     }
 
+    // Transparent pass: alpha-blended rig submeshes (the sail) drawn AFTER the water, so they blend
+    // over the water/scene rather than only the sky. Reuses the rig VB/IB/CBV from the opaque pass
+    // (linear-allocator allocations live the whole frame) and rebinds the per-frame root args.
+    if (rigHasTransparent)
+    {
+        m_profiler.BeginScope("Transparent", cmd);
+        m_gfxContext.SetRenderTarget(*m_currentRT, *m_currentDS);
+        m_gfxContext.SetDescriptorHeap(m_transientHeap.GetHeap());
+        m_gfxContext.SetRootSignature(m_rootSignature.Get());
+        m_gfxContext.SetConstantBufferView(0, frameAlloc.gpuAddress);
+        if (!gpuLights.empty())
+            m_gfxContext.SetShaderResourceView(3, lightsAlloc.gpuAddress);
+        m_gfxContext.SetConstantBufferView(4, rigObjCbv);
+        m_gfxContext.SetConstantBufferView(5, shadowCbAddr);
+        m_gfxContext.SetDescriptorTable(6, shadowSrvGpu);
+        m_gfxContext.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_gfxContext.SetVertexBuffer(rigVBV);
+        m_gfxContext.SetIndexBuffer(rigIBV);
+
+        for (const auto& sub : scene.GetRig().submeshes)
+        {
+            if (!sub.material->alphaBlend)
+                continue;
+            sub.material->Bind(m_gfxContext, m_linearAllocator, m_transientHeap, m_device, m_nullSrvHandle);
+            m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, 0, 0);
+        }
+        m_profiler.EndScope(cmd);
+    }
+
     // Demote shared resources from PSR|NPSR back to NPSR so the next frame's compute
     // queue can re-acquire them without encountering PIXEL_SHADER_RESOURCE states in barriers.
     atm.PrepareForCompute(m_gfxContext);
     water.PrepareForCompute(m_gfxContext);
+}
+
+// Depth-only pass: render shadow casters (scene entities + the dynamic rig) into each cascade slice.
+void Renderer::RenderShadowPass(Scene& scene, const View& view,
+                                const D3D12_VERTEX_BUFFER_VIEW& rigVBV,
+                                const D3D12_INDEX_BUFFER_VIEW& rigIBV, bool rigValid)
+{
+    auto* cmd = m_gfxContext.GetCommandList();
+    m_profiler.BeginScope("Shadow", cmd);
+
+    m_gfxContext.FlushResourceBarriers();
+    m_shadowMap.Barrier(cmd, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+    m_gfxContext.SetRootSignature(m_shadowRootSig.Get());
+    m_gfxContext.SetPipelineState(m_shadowPSO.Get());
+    m_gfxContext.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const UINT res = m_shadowMap.GetResolution();
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, static_cast<float>(res), static_cast<float>(res), 0.0f, 1.0f };
+    D3D12_RECT     sc = { 0, 0, static_cast<LONG>(res), static_cast<LONG>(res) };
+    m_gfxContext.SetViewportAndScissor(vp, sc);
+
+    const DynamicMesh& rig = scene.GetRig();
+
+    for (int c = 0; c < ShadowMap::kCascades; ++c)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = m_shadowMap.GetDSV(c);
+        cmd->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+        cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+        DirectX::XMFLOAT4X4 vpT = m_shadowMap.CascadeViewProjT()[c];
+        auto cAlloc = m_linearAllocator.Allocate(sizeof(vpT));
+        memcpy(cAlloc.cpuAddress, &vpT, sizeof(vpT));
+        m_gfxContext.SetConstantBufferView(0, cAlloc.gpuAddress);   // cascade light view-proj (b0)
+
+        for (const auto& entity : scene.GetEntities())
+        {
+            if (!entity.visible)
+                continue;
+            DirectX::XMFLOAT4X4 wT;
+            DirectX::XMStoreFloat4x4(&wT, DirectX::XMMatrixTranspose(
+                DirectX::XMLoadFloat4x4(&entity.worldTransform)));
+            auto oAlloc = m_linearAllocator.Allocate(sizeof(wT));
+            memcpy(oAlloc.cpuAddress, &wT, sizeof(wT));
+            m_gfxContext.SetConstantBufferView(1, oAlloc.gpuAddress);   // world (b1)
+            m_gfxContext.SetVertexBuffer(entity.mesh->GetVertexBufferView());
+            m_gfxContext.SetIndexBuffer(entity.mesh->GetIndexBufferView());
+            for (const auto& sub : entity.mesh->GetSubMeshes())
+                m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, sub.baseVertex, 0);
+        }
+
+        if (rigValid)
+        {
+            DirectX::XMFLOAT4X4 ident;
+            DirectX::XMStoreFloat4x4(&ident, DirectX::XMMatrixIdentity());
+            auto oAlloc = m_linearAllocator.Allocate(sizeof(ident));
+            memcpy(oAlloc.cpuAddress, &ident, sizeof(ident));
+            m_gfxContext.SetConstantBufferView(1, oAlloc.gpuAddress);
+            m_gfxContext.SetVertexBuffer(rigVBV);
+            m_gfxContext.SetIndexBuffer(rigIBV);
+            for (const auto& sub : rig.submeshes)
+                m_gfxContext.DrawIndexedInstanced(sub.indexCount, 1, sub.startIndex, 0, 0);
+        }
+    }
+
+    m_gfxContext.FlushResourceBarriers();
+    m_shadowMap.Barrier(cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_profiler.EndScope(cmd);
 }
 
 UINT64 Renderer::EndFrame(ColorBuffer& rt, ID3D12Fence* fence, UINT64& nextFenceValue)

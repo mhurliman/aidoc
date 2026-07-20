@@ -132,6 +132,28 @@ void FlyCamera::Update(float dt, const InputManager& input)
     XMStoreFloat3(&m_position, pos);
 }
 
+void FlyCamera::FrameTarget(const XMFLOAT3& target, float distance, float height)
+{
+    m_position = { target.x, target.y + height, target.z - distance };
+    XMVECTOR dir = XMVector3Normalize(
+        XMVectorSet(target.x - m_position.x, target.y - m_position.y,
+                    target.z - m_position.z, 0.0f));
+    float dx = XMVectorGetX(dir), dy = XMVectorGetY(dir), dz = XMVectorGetZ(dir);
+    // Inverse of forward = (cos(pitch)sin(yaw), -sin(pitch), cos(pitch)cos(yaw)).
+    m_yaw   = atan2f(dx, dz);
+    m_pitch = -asinf(dy);
+}
+
+void FlyCamera::SetLookAt(const XMFLOAT3& eye, const XMFLOAT3& target)
+{
+    m_position = eye;
+    XMVECTOR dir = XMVector3Normalize(
+        XMVectorSet(target.x - eye.x, target.y - eye.y, target.z - eye.z, 0.0f));
+    float dx = XMVectorGetX(dir), dy = XMVectorGetY(dir), dz = XMVectorGetZ(dir);
+    m_yaw   = atan2f(dx, dz);
+    m_pitch = -asinf(dy);
+}
+
 XMMATRIX FlyCamera::GetViewMatrix() const
 {
     XMVECTOR eye = XMLoadFloat3(&m_position);

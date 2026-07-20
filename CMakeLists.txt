@@ -25,6 +25,7 @@ FetchContent_MakeAvailable(tinygltf imgui nlohmann_json)
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
     src/App.cpp
+    src/SimBridge.cpp
     src/Renderer.cpp
     src/util/InputManager.cpp
     src/util/OrbitCamera.cpp
@@ -37,6 +38,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/gfx/GraphicsContext.cpp
     src/gfx/ColorBuffer.cpp
     src/gfx/DepthBuffer.cpp
+    src/gfx/ShadowMap.cpp
     src/gfx/PixelBuffer.cpp
     src/gfx/GpuBuffer.cpp
     src/assets/Texture.cpp
@@ -64,6 +66,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_compile_options(${PROJECT_NAME} PRIVATE /GR-)
 
+# Prevent <windows.h> from defining min()/max() macros that collide with std::min/std::max.
+target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
+
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.h)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -71,6 +76,34 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxgi
     nlohmann_json::nlohmann_json
 )
+
+# ------------------------------------------------------------------------------------------------
+# .NET hosting: embed the C# physics sim (Sim.Host.dll from the sailboat-sim repo) via nethost.
+# ------------------------------------------------------------------------------------------------
+file(GLOB NETHOST_NATIVE_DIRS
+    "C:/Program Files/dotnet/packs/Microsoft.NETCore.App.Host.win-x64/*/runtimes/win-x64/native")
+if(NOT NETHOST_NATIVE_DIRS)
+    message(FATAL_ERROR "nethost pack not found. Install the .NET SDK (win-x64 host pack).")
+endif()
+list(SORT NETHOST_NATIVE_DIRS)
+list(GET NETHOST_NATIVE_DIRS -1 NETHOST_DIR)   # newest version
+message(STATUS "Using nethost from: ${NETHOST_DIR}")
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${NETHOST_DIR})
+target_link_libraries(${PROJECT_NAME} PRIVATE "${NETHOST_DIR}/nethost.lib")
+
+# Build Sim.Host (C#) alongside aidoc, and copy its managed assemblies next to the exe.
+set(SAILBOAT_SIM_DIR "${CMAKE_SOURCE_DIR}/../sailboat-sim"
+    CACHE PATH "Path to the sailboat-sim repo (provides the Sim.Host physics DLL)")
+set(SIM_HOST_PROJECT "${SAILBOAT_SIM_DIR}/src/Sim.Host/Sim.Host.csproj")
+set(SIM_HOST_OUTPUT_DIR "${SAILBOAT_SIM_DIR}/src/Sim.Host/bin/$<CONFIG>/net9.0")
+
+add_custom_target(sim_host ALL
+    COMMAND dotnet build "${SIM_HOST_PROJECT}" -c $<CONFIG> --nologo -v quiet
+    COMMENT "Building Sim.Host (C# physics sim)"
+    VERBATIM
+)
+add_dependencies(${PROJECT_NAME} sim_host)
 
 # Find dxc shader compiler
 find_program(DXC_EXECUTABLE dxc
@@ -97,6 +130,7 @@ set(SHADER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
 set(COMMON_HLSLI "${CMAKE_SOURCE_DIR}/shaders/Common.hlsli")
+set(SHADOW_HLSLI "${CMAKE_SOURCE_DIR}/shaders/Shadow.hlsli")
 
 set(SHADER_SOURCES
     "${CMAKE_SOURCE_DIR}/shaders/triangle.hlsl"
@@ -113,7 +147,7 @@ foreach(SHADER_FILE ${SHADER_SOURCES})
     add_custom_command(
         OUTPUT ${VS_OUTPUT}
         COMMAND ${DXC_EXECUTABLE} -T vs_6_0 -E VSMain ${DXC_SHADER_FLAGS} -Fo ${VS_OUTPUT} ${SHADER_FILE}
-        DEPENDS ${SHADER_FILE} ${COMMON_HLSLI}
+        DEPENDS ${SHADER_FILE} ${COMMON_HLSLI} ${SHADOW_HLSLI}
         COMMENT "Compiling VS: ${SHADER_NAME}"
         VERBATIM
     )
@@ -121,7 +155,7 @@ foreach(SHADER_FILE ${SHADER_SOURCES})
     add_custom_command(
         OUTPUT ${PS_OUTPUT}
         COMMAND ${DXC_EXECUTABLE} -T ps_6_0 -E PSMain ${DXC_SHADER_FLAGS} -Fo ${PS_OUTPUT} ${SHADER_FILE}
-        DEPENDS ${SHADER_FILE} ${COMMON_HLSLI}
+        DEPENDS ${SHADER_FILE} ${COMMON_HLSLI} ${SHADOW_HLSLI}
         COMMENT "Compiling PS: ${SHADER_NAME}"
         VERBATIM
     )
@@ -144,7 +178,9 @@ foreach(RS_ENTRY ${RS_SOURCES})
     add_custom_command(
         OUTPUT ${RS_OUTPUT}
         COMMAND ${DXC_EXECUTABLE} -T rootsig_1_1 -E ROOTSIG -Fo ${RS_OUTPUT} ${RS_FILE}
-        DEPENDS ${RS_FILE}
+        DEPENDS ${RS_FILE} ${COMMON_HLSLI}
+                "${CMAKE_SOURCE_DIR}/shaders/Water/WaterCommon.hlsli"
+                "${CMAKE_SOURCE_DIR}/shaders/FFT/FFTCommon.hlsli"
         COMMENT "Compiling RS: ${RS_NAME}"
         VERBATIM
     )
@@ -179,6 +215,18 @@ foreach(CS_ENTRY ${COMPUTE_SHADERS})
     )
     list(APPEND SHADER_OUTPUTS ${CS_OUTPUT})
 endforeach()
+
+# Shadow depth-only caster shader (VS only)
+set(SHADOW_VS_OUTPUT "${SHADER_OUTPUT_DIR}/ShadowDepth_vs.cso")
+add_custom_command(
+    OUTPUT ${SHADOW_VS_OUTPUT}
+    COMMAND ${DXC_EXECUTABLE} -T vs_6_0 -E VSMain ${DXC_SHADER_FLAGS} -Fo ${SHADOW_VS_OUTPUT}
+            "${CMAKE_SOURCE_DIR}/shaders/ShadowDepth.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/ShadowDepth.hlsl"
+    COMMENT "Compiling VS: ShadowDepth"
+    VERBATIM
+)
+list(APPEND SHADER_OUTPUTS ${SHADOW_VS_OUTPUT})
 
 # Water surface vertex and pixel shaders
 set(WATER_COMMON_INC "${CMAKE_SOURCE_DIR}/shaders/Water/WaterCommon.hlsli")
@@ -326,4 +374,20 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         ${CMAKE_SOURCE_DIR}/textures
         $<TARGET_FILE_DIR:${PROJECT_NAME}>/textures
     COMMENT "Copying shaders, models, scenes, and textures to output directory"
+)
+
+# Copy the managed sim assemblies + runtime config and nethost.dll next to the exe.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.dll"
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.runtimeconfig.json"
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.deps.json"
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Core.dll"
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Models.dll"
+        "${SIM_HOST_OUTPUT_DIR}/Sim.Telemetry.dll"
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${NETHOST_DIR}/nethost.dll"
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
+    COMMENT "Copying Sim.Host managed assemblies + nethost.dll to output directory"
 )

@@ -21,7 +21,7 @@ struct WaterDesc
     int N;
     int M;
     float TileSize;           // mesh tile span in metres (== largest cascade tile)
-    int MeshResolution = 128;  // base grid vertices per side before tessellation
+    int MeshResolution = 32;   // base grid vertices per side before tessellation
 };
 
 class FFTWaterSurface
@@ -29,7 +29,7 @@ class FFTWaterSurface
 public:
     struct WaterTweaks
     {
-        float windSpeed       = 10.0f;
+        float windSpeed       = 5.0f;
         float windTheta       = 0.0f;   // radians, direction wind blows toward
         float amplitude       = 0.1f;
         float smallWaveCutoff = 0.01f;
@@ -41,7 +41,7 @@ public:
         bool  visible         = true;
         bool  wireframe       = false;
         int   tileCount       = 3;      // tiles per side; 1=single, 3=3×3 grid, etc.
-        int   meshResolution  = 128;    // base grid vertices per side (runtime-changeable)
+        int   meshResolution  = 32;     // base grid vertices per side (runtime-changeable)
         bool  tessellation    = true;   // use HS/DS tessellation; false = plain VS + triangle list
     };
 
@@ -101,6 +101,23 @@ public:
     // Naturally handles tiling — worldX/worldZ can be any value.
     float SampleHeightCPU(float worldX, float worldZ, float elapsedTime, int modes = 4) const;
 
+    // Batched surface fill over a regular G×G world grid (cell 0,0 at originX/originZ, spacing
+    // `cell`). Sums the same cascades as SampleHeightCPU but evaluates the whole grid at once:
+    // each mode's complex amplitude is computed once, then exp(i·k·x) is marched across the grid by
+    // complex recurrence (no per-cell transcendentals). This makes a WIDE mode band affordable, so
+    // buoyancy can sample the full 512→1 m spectrum the GPU renders instead of a few low slivers.
+    // outHeights is row-major [G*G]. elapsedTime must match Update()'s.
+    void SampleHeightGrid(float originX, float originZ, float cell, int G,
+                          float elapsedTime, int modes, float* outHeights) const;
+
+    // Like SampleHeightGrid but ALSO outputs the horizontal Tessendorf choppiness displacement
+    // (Dx, Dz) that the GPU applies to each surface point (WorldPos.xz += disp·rcp). With a high
+    // mode count and by placing markers at (grid + disp, height), this reproduces the exact surface
+    // the GPU renders — used by the debug overlay to confirm the CPU sampling matches 1:1.
+    // outHeights / outDispX / outDispZ are row-major [G*G].
+    void SampleSurfaceGrid(float originX, float originZ, float cell, int G, float elapsedTime,
+                           int modes, float* outHeights, float* outDispX, float* outDispZ) const;
+
     // Populate the CpuHeightfield cache for the current frame.
     // Call once per frame before any Sample/QueryRange calls.
     void BuildHeightfield(float elapsedTime, int modes = 4);
@@ -118,7 +135,9 @@ public:
     void Render(GraphicsContext& ctx, LinearAllocator& alloc, const View& view,
                 const DirectX::XMFLOAT3& lightDir,
                 D3D12_CPU_DESCRIPTOR_HANDLE sceneDepthSRV,
-                D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSRV);
+                D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSRV,
+                D3D12_CPU_DESCRIPTOR_HANDLE shadowArraySRV,
+                D3D12_GPU_VIRTUAL_ADDRESS   shadowCascadeCB);
 
 private:
     // Matches FFTCommon.hlsli FFTParameters
@@ -281,6 +300,7 @@ private:
         kRenderSceneDepth = kRenderTable + kRenderMapCount,      // +9
         kRenderSceneColor = kRenderTable + kRenderMapCount + 1,  // +10
         kRenderEnvCube    = kRenderTable + kRenderMapCount + 2,  // +11
+        kRenderShadow     = kRenderTable + kRenderMapCount + 3,  // +12  (cascaded shadow array)
 
         kHeapSlotCount   = 192,
     };

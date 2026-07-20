@@ -263,6 +263,41 @@ void Mesh::LoadFromGltf(const std::string& path, ID3D12Device* device,
     CreateBuffers(device);
 }
 
+void Mesh::CreateFromArrays(const float* positions, const float* normals, uint32_t vertexCount,
+                            const uint32_t* indices, uint32_t indexCount,
+                            std::shared_ptr<Material> material, ID3D12Device* device)
+{
+    m_vertices.resize(vertexCount);
+    for (uint32_t i = 0; i < vertexCount; ++i)
+    {
+        PbrVertex& v = m_vertices[i];
+        v.position[0] = positions[3 * i + 0];
+        v.position[1] = positions[3 * i + 1];
+        v.position[2] = positions[3 * i + 2];
+        v.normal[0] = normals[3 * i + 0];
+        v.normal[1] = normals[3 * i + 1];
+        v.normal[2] = normals[3 * i + 2];
+        v.uv[0] = 0.0f;
+        v.uv[1] = 0.0f;
+    }
+
+    m_indices.assign(indices, indices + indexCount);
+
+    m_materials.clear();
+    m_materials.push_back(std::move(material));
+
+    SubMesh sub;
+    sub.name = "hull";
+    sub.indexCount = indexCount;
+    sub.startIndex = 0;
+    sub.baseVertex = 0;
+    sub.materialIndex = 0;
+    m_subMeshes.clear();
+    m_subMeshes.push_back(sub);
+
+    CreateBuffers(device);
+}
+
 void Mesh::CreateBuffers(ID3D12Device* device)
 {
     D3D12_HEAP_PROPERTIES uploadHeap = {};

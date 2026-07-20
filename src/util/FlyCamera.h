@@ -12,6 +12,14 @@ public:
     void SetMoveSpeed(float speed);
     void SetLookSensitivity(float sensitivity);
 
+    // Place the camera <distance> behind and <height> above <target>, looking at it.
+    // Used by the boat-follow mode so the sim boat is always framed regardless of drift.
+    void FrameTarget(const DirectX::XMFLOAT3& target, float distance, float height);
+
+    // Position the camera at <eye> looking at <target> (both world space). Used by the chase cam,
+    // which computes its own smoothed eye/target from the boat pose.
+    void SetLookAt(const DirectX::XMFLOAT3& eye, const DirectX::XMFLOAT3& target);
+
     void Update(float dt, const InputManager& input);
 
     DirectX::XMMATRIX GetViewMatrix() const;

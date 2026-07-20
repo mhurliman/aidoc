@@ -1,4 +1,5 @@
 #include "Common.hlsli"
+#include "Shadow.hlsli"
 
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT 1
@@ -31,6 +32,12 @@ cbuffer MaterialConstants : register(b1) {
     float _matPad;
 };
 
+// Per-object world transform (b2). Defaults to identity for statically-placed meshes;
+// driven per-frame for the sim boat. Stored transposed on the CPU (same convention as viewProj).
+cbuffer ObjectConstants : register(b2) {
+    float4x4 world;
+};
+
 Texture2D baseColorTex : register(t0);
 Texture2D emissiveTex  : register(t1);
 StructuredBuffer<Light> lights : register(t2);
@@ -52,9 +59,10 @@ struct PSInput {
 [RootSignature(ROOTSIG)]
 PSInput VSMain(VSInput input) {
     PSInput output;
-    output.clipPos = mul(float4(input.position, 1.0), viewProj);
-    output.worldPos = input.position;
-    output.worldNorm = input.normal;
+    float4 worldPos = mul(float4(input.position, 1.0), world);
+    output.clipPos = mul(worldPos, viewProj);
+    output.worldPos = worldPos.xyz;
+    output.worldNorm = mul(input.normal, (float3x3)world);
     output.uv = input.uv;
     return output;
 }
@@ -101,6 +109,7 @@ float4 PSMain(PSInput input) : SV_TARGET {
     float NoV = max(dot(N, V), 0.001);
 
     float3 Lo = float3(0, 0, 0);
+    float sunVis = ComputeSunShadow(input.worldPos);
 
     for (int i = 0; i < numLights; i++) {
         Light light = lights[i];
@@ -109,7 +118,9 @@ float4 PSMain(PSInput input) : SV_TARGET {
         float attenuation = 1.0;
 
         if (light.type == LIGHT_DIRECTIONAL) {
-            L = normalize(light.direction);
+            // light.direction is the travel direction (sun→scene); the surface→light vector is its negation.
+            L = normalize(-light.direction);
+            attenuation = sunVis;   // only the sun casts shadows
         } else {
             float3 toLight = light.position - input.worldPos;
             float dist = length(toLight);

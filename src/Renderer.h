@@ -7,6 +7,7 @@
 #include "gfx/LinearAllocator.h"
 #include "gfx/DescriptorHeap.h"
 #include "gfx/PixelBuffer.h"
+#include "gfx/ShadowMap.h"
 #include "assets/ResourceManager.h"
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -43,6 +44,10 @@ public:
 
 private:
     void InitShaders();
+    void InitShadow();
+    void RenderShadowPass(Scene& scene, const View& view,
+                          const D3D12_VERTEX_BUFFER_VIEW& rigVBV,
+                          const D3D12_INDEX_BUFFER_VIEW& rigIBV, bool rigValid);
 
     ID3D12Device*       m_device        = nullptr;
     ID3D12CommandQueue* m_graphicsQueue = nullptr;
@@ -63,8 +68,14 @@ private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     D3D12_CPU_DESCRIPTOR_HANDLE m_nullSrvHandle = {};
 
+    ShadowMap                   m_shadowMap;
+    ComPtr<ID3D12RootSignature> m_shadowRootSig;
+    ComPtr<ID3D12PipelineState> m_shadowPSO;
+
     ColorBuffer* m_currentRT = nullptr;
     DepthBuffer* m_currentDS = nullptr;
+    D3D12_VIEWPORT m_mainViewport = {};
+    D3D12_RECT     m_mainScissor  = {};
 
     PixelBuffer m_sceneColorCopy;
     ComPtr<ID3D12DescriptorHeap> m_sceneColorSRVHeap;

@@ -1,13 +1,5 @@
 {
-    "entities": [
-        {
-            "mesh": "models/scene.gltf"
-        },
-        {
-            "mesh": "models/teapot.gltf",
-            "shader": "phong"
-        }
-    ],
+    "entities": [],
     "lights": [
         {
             "type": "directional",

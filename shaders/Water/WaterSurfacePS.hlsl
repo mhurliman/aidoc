@@ -9,8 +9,40 @@ Texture2D<float2>   GradientMap[NUM_CASCADES] : register(t3);
 Texture2D<float>    SceneDepth     : register(t9);
 Texture2D<float4>   SceneColor     : register(t10);
 TextureCube<float4> ReflectionMap  : register(t11);
+Texture2DArray<float> ShadowMap    : register(t12);
 
-SamplerState LinearSampler : register(s0);
+SamplerState           LinearSampler : register(s0);
+SamplerComparisonState ShadowSampler : register(s1);
+
+// Cascaded shadow matrices (matches the mesh ShadowConstants layout).
+cbuffer ShadowConstants : register(b2)
+{
+    float4x4 cascadeViewProj[3];
+    float4   shadowParams;   // x = texel size, y = depth bias, z = cascade count, w = enabled
+};
+
+// Sun visibility [0,1] at a world position (PCF 3x3). 1 = lit, 0 = shadowed.
+float ComputeSunShadow(float3 worldPos)
+{
+    if (shadowParams.w < 0.5) return 1.0;
+    int cascade = -1;
+    float3 ndc = float3(0, 0, 0);
+    [unroll] for (int c = 0; c < 3; ++c)
+    {
+        float4 lp = mul(float4(worldPos, 1.0), cascadeViewProj[c]);
+        float3 p = lp.xyz / lp.w;
+        if (all(abs(p.xy) < 1.0) && p.z >= 0.0 && p.z <= 1.0) { cascade = c; ndc = p; break; }
+    }
+    if (cascade < 0) return 1.0;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+    float compare = ndc.z - shadowParams.y * (cascade + 1);
+    float texel = shadowParams.x;
+    float sum = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+        [unroll] for (int x = -1; x <= 1; ++x)
+            sum += ShadowMap.SampleCmpLevelZero(ShadowSampler, float3(uv + float2(x, y) * texel, cascade), compare);
+    return sum / 9.0;
+}
 
 // Converts an NDC depth sample to linear view-space distance (metres).
 // Valid for a standard left-handed projection (near -> 0, far -> 1).
@@ -60,10 +92,15 @@ float4 PSMain(PSInput Input) : SV_Target
     float3 UnderwaterColor = Water.ColorMax.rgb * 0.6;
     EnvColor = lerp(UnderwaterColor, EnvColor, smoothstep(-0.05, 0.15, ReflectDir.y));
 
-    float  Specular = pow(max(0, dot(reflect(-L, Normal), V)), 720.0) * 210.0;
+    // Cascaded shadow from the boat/rig onto the sea. Darkens the sun-lit diffuse + specular, and
+    // dims the reflection a little so the shadow still reads at grazing angles.
+    float  Sun      = ComputeSunShadow(Input.PositionW);
+    float  Specular = pow(max(0, dot(reflect(-L, Normal), V)), 720.0) * 210.0 * Sun;
 
     float  NDotL      = max(0.5, dot(Normal, L));
-    float3 FinalColor = lerp(DiffuseColor * NDotL, EnvColor + Specular, Fresnel);
+    float  Shade      = lerp(0.28, 1.0, Sun);   // shadowed water keeps some ambient, not black
+    EnvColor         *= lerp(0.75, 1.0, Sun);
+    float3 FinalColor = lerp(DiffuseColor * NDotL * Shade, EnvColor + Specular, Fresnel);
 
     return float4(FinalColor, 1.0);
 }
