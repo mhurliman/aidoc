@@ -43,6 +43,10 @@ private:
     void InitViewport();
     void LoadScene();
     void InitImGui(HWND hwnd);
+    void LoadProps();          // load floating OBJ props onto the ocean
+    void UpdateProps();        // per-frame single-point buoyancy for the props
+    void SetupWaveDebug();     // build the CPU-vs-GPU surface overlay (materials + tile mesh)
+    void UpdateDebugWaveMesh();// refill the overlay each frame
     void WaitForGpu();
     void WaitForFrame(UINT frameIndex);
     void Resize(UINT width, UINT height);
@@ -76,7 +80,29 @@ private:
     int m_fpsFrameCount = 0;
     float m_elapsedTime = 0.0f;
     bool m_vsync = false;
+    bool m_timePaused = false;     // freezes the ocean-wave clock (camera stays live)
 
-    float m_sunElevation = 45.0f;  // degrees above horizon
-    float m_sunAzimuth   = 180.0f; // degrees
+    float m_sunElevation = 20.0f;  // degrees above horizon
+    float m_sunAzimuth   = 45.0f;  // degrees
+
+    // Floating OBJ props (single-point buoyancy on the FFT ocean), scattered around the origin.
+    struct FloatingProp
+    {
+        int   entity   = -1;            // index into m_scene entities
+        float x = 0.0f, z = 0.0f;       // world XZ where it bobs
+        float yaw      = 0.0f;          // random heading (radians)
+        float scale    = 1.0f;          // normalizes each model to a common world size
+        float center[3] = {0, 0, 0};    // model-space AABB center (pivot-independent float)
+    };
+    std::vector<FloatingProp> m_props;
+    float m_propX    = 0.0f;   // wave-debug grid center (origin)
+    float m_propZ    = 0.0f;
+    float m_propSink = 0.0f;   // global waterline offset applied to all props
+
+    // Wave debug overlay: green tiles = CPU buoyancy surface (SampleHeightCPU), magenta tiles =
+    // GPU/render surface (high-mode height + choppiness displacement). The gap is the disparity.
+    bool m_showWaveDebug = false;
+    std::shared_ptr<Material> m_waveDebugMat;  // magenta (GPU surface)
+    std::shared_ptr<Material> m_physSurfMat;   // green (buoyancy surface)
+    std::vector<float> m_dbgH, m_dbgDx, m_dbgDz;
 };

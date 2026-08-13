@@ -9,6 +9,12 @@
     "    SRV(t0, numDescriptors = 3)," \
     "    UAV(u0, numDescriptors = 3))"
 
+// Mip-chain downsample: one source-mip SRV, one dest-mip UAV, small params cbuffer.
+#define DOWNSAMPLE_ROOTSIG "RootFlags(0)," \
+    "CBV(b0)," \
+    "DescriptorTable(SRV(t0, numDescriptors = 1))," \
+    "DescriptorTable(UAV(u0, numDescriptors = 1))"
+
 static const float Pi = 3.1415926;
 static const float g = 9.81f;
 

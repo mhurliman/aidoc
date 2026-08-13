@@ -9,6 +9,7 @@ cbuffer Globals : register(b1)
     float WindSpeed;
     float SmallWaveLengthCutoff;
     float Amplitude;
+    float DirExponent;   // sharpens the directional lobe: (k̂·ŵ)^(2·DirExponent). 1 = classic cos²
 }
 
 Texture2D<float2> Noise : register(t0);
@@ -29,6 +30,7 @@ float PhillipsSpectrum2D(float2 k)
 
     float Cutoff = exp(-k2 * Square(SmallWaveLengthCutoff));
     float kw2 = Square(dot(normalize(k), normalize(WindDir)));
+    kw2 = pow(kw2, DirExponent);   // concentrate energy along the wind axis
 
     return Amplitude * exp(-1.0 / kL2) * kw2 * Cutoff / k4;
 }

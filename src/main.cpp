@@ -9,8 +9,8 @@
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
-static LPCTSTR g_windowClassName = TEXT("AidocWindowClass");
-static LPCTSTR g_windowTitle = TEXT("aidoc - D3D12 Hello Triangle");
+static LPCTSTR g_windowClassName = TEXT("WaveSimWindowClass");
+static LPCTSTR g_windowTitle = TEXT("WaveSim");
 static bool g_running = true;
 static App g_app;
 

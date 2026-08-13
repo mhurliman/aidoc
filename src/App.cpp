@@ -3,6 +3,7 @@
 #include "IRenderer.h"
 #include "assets/Mesh.h"
 #include "assets/Material.h"
+#include "assets/ObjLoader.h"
 #include "util/Assert.h"
 #include <cmath>
 #include <cstring>
@@ -42,6 +43,7 @@ void App::Init(HWND hwnd)
     m_renderer->Init(m_device.Get(), m_commandQueue.Get(), FrameCount);
 
     LoadScene();
+    LoadProps();
     InitImGui(hwnd);
 
     float aspectRatio = static_cast<float>(WindowWidth) / static_cast<float>(WindowHeight);
@@ -278,6 +280,199 @@ void App::OnWindowMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 }
 
+// Load a floating OBJ prop and drop it into the scene in front of the camera.
+void App::LoadProps()
+{
+    struct ModelDef { const char* file; XMFLOAT4 color; };
+    const ModelDef models[] = {
+        { "models/suzanne.obj",   { 0.80f, 0.45f, 0.20f, 1.0f } },
+        { "models/spot.obj",      { 0.85f, 0.75f, 0.55f, 1.0f } },
+        { "models/teapot.obj",    { 0.55f, 0.65f, 0.85f, 1.0f } },
+        { "models/armadillo.obj", { 0.55f, 0.72f, 0.50f, 1.0f } },
+        { "models/happy.obj",     { 0.80f, 0.72f, 0.86f, 1.0f } },
+    };
+
+    srand(0x5EA0CEA1u);            // deterministic scatter layout
+    const float kArea   = 22.0f;   // half-extent (m) of the scatter square around the origin
+    const float kTarget = 3.0f;    // approximate world size each model is normalized to
+    auto rnd01 = []() { return (float)rand() / (float)RAND_MAX; };
+
+    for (const ModelDef& md : models)
+    {
+        std::vector<float> pos, nrm;
+        std::vector<uint32_t> idx;
+        if (!LoadObj(ResolveExePath(md.file), pos, nrm, idx))
+        {
+            fprintf(stderr, "[prop] failed to load %s; skipping.\n", md.file);
+            continue;
+        }
+
+        // AABB → pivot-independent center + a scale that normalizes every model to ~kTarget metres.
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (size_t i = 0; i + 2 < pos.size(); i += 3)
+            for (int k = 0; k < 3; ++k)
+            {
+                mn[k] = pos[i + k] < mn[k] ? pos[i + k] : mn[k];
+                mx[k] = pos[i + k] > mx[k] ? pos[i + k] : mx[k];
+            }
+        float ext = 1e-4f;
+        for (int k = 0; k < 3; ++k) ext = (mx[k] - mn[k]) > ext ? (mx[k] - mn[k]) : ext;
+
+        auto mat = m_renderer->GetResourceManager().CreateMaterial(md.file);
+        mat->baseColorFactor = md.color;
+        mat->roughness    = 0.5f;
+        mat->metallic     = 0.0f;
+        mat->doubleSided  = true;
+        mat->shadingModel = ShadingModel::PBR;
+        mat->CreatePSO(m_device.Get());
+
+        auto mesh = std::make_shared<Mesh>();
+        mesh->CreateFromArrays(pos.data(), nrm.data(), static_cast<uint32_t>(pos.size() / 3),
+                               idx.data(), static_cast<uint32_t>(idx.size()), mat, m_device.Get());
+
+        Entity e;
+        e.mesh    = mesh;
+        e.visible = true;
+        XMStoreFloat4x4(&e.worldTransform, XMMatrixIdentity());
+        m_scene.GetEntities().push_back(e);
+
+        FloatingProp fp;
+        fp.entity = static_cast<int>(m_scene.GetEntities().size()) - 1;
+        fp.x      = (rnd01() * 2.0f - 1.0f) * kArea;
+        fp.z      = (rnd01() * 2.0f - 1.0f) * kArea;
+        fp.yaw    = rnd01() * 6.2831853f;
+        fp.scale  = kTarget / ext;
+        for (int k = 0; k < 3; ++k) fp.center[k] = 0.5f * (mn[k] + mx[k]);
+        m_props.push_back(fp);
+    }
+
+    SetupWaveDebug();
+}
+
+// ---- Wave debug overlay ------------------------------------------------------------------------
+// Tunables for the CPU-vs-GPU surface overlay (a grid of small tiles around the prop).
+namespace { constexpr int kDebugGrid = 20; constexpr int kDebugModes = 32; constexpr float kDebugSide = 16.0f; }
+
+// Build the overlay's fixed topology (two overlaid tile grids) + its materials once.
+void App::SetupWaveDebug()
+{
+    auto makeDbgMat = [&](const char* key, XMFLOAT4 col) {
+        auto m = m_renderer->GetResourceManager().CreateMaterial(key);
+        m->baseColorFactor = col;
+        m->emissiveFactor  = { col.x * 0.6f, col.y * 0.6f, col.z * 0.6f };  // glow so it reads over water
+        m->roughness    = 0.6f;
+        m->metallic     = 0.0f;
+        m->doubleSided  = true;
+        m->shadingModel = ShadingModel::PBR;
+        m->CreatePSO(m_device.Get());
+        return m;
+    };
+    m_physSurfMat  = makeDbgMat("wave_phys", { 0.15f, 0.95f, 0.25f, 1.0f });  // green  = buoyancy
+    m_waveDebugMat = makeDbgMat("wave_gpu",  { 1.00f, 0.10f, 0.90f, 1.0f });  // magenta = GPU surface
+
+    const int tiles = kDebugGrid * kDebugGrid;
+    m_dbgH.resize(tiles); m_dbgDx.resize(tiles); m_dbgDz.resize(tiles);
+
+    auto& dbg = m_scene.GetDebug();
+    dbg.vertices.resize(static_cast<size_t>(tiles) * 4 * 2);   // [green tiles][magenta tiles]
+    dbg.indices.clear();
+    dbg.indices.reserve(static_cast<size_t>(tiles) * 6 * 2);
+    for (int t = 0; t < tiles * 2; ++t)
+    {
+        uint32_t b = static_cast<uint32_t>(t) * 4;
+        dbg.indices.push_back(b + 0); dbg.indices.push_back(b + 1); dbg.indices.push_back(b + 2);
+        dbg.indices.push_back(b + 0); dbg.indices.push_back(b + 2); dbg.indices.push_back(b + 3);
+    }
+    uint32_t perSurf = static_cast<uint32_t>(tiles) * 6;
+    dbg.submeshes = {
+        { 0u,      perSurf, m_physSurfMat },   // green:   verts [0, tiles*4)
+        { perSurf, perSurf, m_waveDebugMat },  // magenta: verts [tiles*4, 2*tiles*4)
+    };
+    dbg.visible = false;
+}
+
+// Refill the overlay each frame: green = exactly what buoyancy samples (SampleHeightCPU, modes=6,
+// un-displaced); magenta = the GPU/render surface (high-mode height + choppiness displacement,
+// placed at the displaced position like the water vertex shader).
+void App::UpdateDebugWaveMesh()
+{
+    auto& dbg = m_scene.GetDebug();
+    dbg.visible = m_showWaveDebug;
+    if (!m_showWaveDebug || dbg.vertices.empty()) return;
+
+    auto& water = m_scene.GetWaterSurface();
+    constexpr int DG = kDebugGrid;
+    const int   tiles = DG * DG;
+    const float cell  = kDebugSide / (DG - 1);
+    const float ox    = m_propX - kDebugSide * 0.5f;
+    const float oz    = m_propZ - kDebugSide * 0.5f;
+
+    water.SampleSurfaceGrid(ox, oz, cell, DG, m_elapsedTime, kDebugModes,
+                            m_dbgH.data(), m_dbgDx.data(), m_dbgDz.data());
+
+    constexpr float half = 0.12f;
+    auto writeTile = [&](int base, float wx, float h, float wz)
+    {
+        auto set = [&](int k, float dx, float dz)
+        {
+            PbrVertex& v = dbg.vertices[base + k];
+            v.position[0] = wx + dx; v.position[1] = h; v.position[2] = wz + dz;
+            v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+            v.uv[0] = v.uv[1] = 0.0f;
+        };
+        set(0, -half, -half); set(1, half, -half); set(2, half, half); set(3, -half, half);
+    };
+
+    for (int j = 0; j < DG; ++j)
+        for (int i = 0; i < DG; ++i)
+        {
+            int   idx = j * DG + i;
+            float gx  = ox + i * cell, gz = oz + j * cell;
+            // GREEN — exactly the buoyancy sample used to float the prop (modes match UpdateProps).
+            float hp = water.SampleHeightCPU(gx, gz, m_elapsedTime, 6);
+            writeTile(idx * 4, gx, hp, gz);
+            // MAGENTA — GPU/render surface: displaced like the water vertex shader.
+            writeTile((tiles + idx) * 4, gx + m_dbgDx[idx], m_dbgH[idx], gz + m_dbgDz[idx]);
+        }
+}
+
+// Single-point buoyancy: sit each prop on the water at its fixed XZ and tilt it to the local
+// surface normal (finite-differenced from the CPU wave height). Cheap and reads convincingly.
+void App::UpdateProps()
+{
+    auto& water = m_scene.GetWaterSurface();
+    const int   modes = 6;      // low-frequency swell that dominates buoyancy
+    const float e     = 0.75f;  // finite-difference step (m) for the surface slope
+
+    for (const FloatingProp& p : m_props)
+    {
+        float h   = water.SampleHeightCPU(p.x,     p.z,     m_elapsedTime, modes);
+        float hxp = water.SampleHeightCPU(p.x + e, p.z,     m_elapsedTime, modes);
+        float hxm = water.SampleHeightCPU(p.x - e, p.z,     m_elapsedTime, modes);
+        float hzp = water.SampleHeightCPU(p.x,     p.z + e, m_elapsedTime, modes);
+        float hzm = water.SampleHeightCPU(p.x,     p.z - e, m_elapsedTime, modes);
+
+        XMVECTOR up = XMVector3Normalize(
+            XMVectorSet(-(hxp - hxm) / (2.0f * e), 1.0f, -(hzp - hzm) / (2.0f * e), 0.0f));
+        XMVECTOR fwdRef = XMVectorSet(sinf(p.yaw), 0.0f, cosf(p.yaw), 0.0f);  // random heading
+        XMVECTOR right  = XMVector3Normalize(XMVector3Cross(up, fwdRef));
+        XMVECTOR fwd    = XMVector3Cross(right, up);
+
+        XMMATRIX rot;
+        rot.r[0] = XMVectorSetW(right, 0.0f);
+        rot.r[1] = XMVectorSetW(up,    0.0f);
+        rot.r[2] = XMVectorSetW(fwd,   0.0f);
+        rot.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+
+        // Center the geometry (T(-center)) before scale/rotate so any pivot floats at (x, h, z),
+        // then sink by m_propSink. This puts the model ON the surface rather than above it.
+        XMMATRIX world = XMMatrixTranslation(-p.center[0], -p.center[1], -p.center[2]) *
+                         XMMatrixScaling(p.scale, p.scale, p.scale) * rot *
+                         XMMatrixTranslation(p.x, h + m_propSink, p.z);
+        XMStoreFloat4x4(&m_scene.GetEntities()[p.entity].worldTransform, world);
+    }
+}
+
 void App::Update(float dt)
 {
     // ImGui gets first priority on input consumption
@@ -293,8 +488,14 @@ void App::Update(float dt)
         }
     }
 
+    if (m_inputManager.IsKeyPressed('P'))
+        m_timePaused = !m_timePaused;
+
     m_camera.Update(dt, m_inputManager);
-    m_elapsedTime += dt;
+    if (!m_timePaused)
+        m_elapsedTime += dt;   // freezing this holds the whole sea (render + buoyancy) still
+    UpdateProps();
+    UpdateDebugWaveMesh();
 
     m_fpsFrameCount++;
     m_fpsAccumulator += dt;
@@ -378,6 +579,9 @@ void App::Render()
     ImGui::Text("Camera: %.2f, %.2f, %.2f", pos.x, pos.y, pos.z);
     ImGui::SliderFloat("Move Speed", &m_camera.GetMoveSpeed(), 1.0f, 50.0f);
     ImGui::Checkbox("VSync", &m_vsync);
+    ImGui::SameLine();
+    if (ImGui::Button(m_timePaused ? "Resume (P)" : "Pause (P)"))
+        m_timePaused = !m_timePaused;
     ImGui::Separator();
 
     int entityIdx = 0;
@@ -471,6 +675,7 @@ void App::Render()
         ImGui::SliderInt("Mesh Resolution", &tweaks.meshResolution, 4, 512);
         ImGui::SliderFloat("Wind Speed",        &tweaks.windSpeed,       0.1f, 100.0f);
         ImGui::SliderAngle("Wind Direction",    &tweaks.windTheta,       -180.0f, 180.0f);
+        ImGui::SliderFloat("Directionality",    &tweaks.directionality,  1.0f, 8.0f, "%.1f");
         ImGui::SliderFloat("Amplitude",         &tweaks.amplitude,       0.0f, 0.25f, "%.3f");
         ImGui::SliderFloat("Small Wave Cutoff", &tweaks.smallWaveCutoff, 0.001f, 0.1f, "%.4f");
         ImGui::SliderFloat("Choppiness",        &tweaks.choppiness,      0.0f,   1.0f);
@@ -478,17 +683,45 @@ void App::Render()
         ImGui::SliderFloat("Max Tess",          &tweaks.maxTessellation, 1.0f,   64.0f);
         ImGui::SliderFloat("Tess Distance",     &tweaks.tessDistance,    0.0f, 1000.0f);
         ImGui::ColorEdit3 ("Color",             &tweaks.color.x);
+        ImGui::SliderFloat("Sky Ambient",       &tweaks.ambient,         0.0f, 2.0f, "%.2f");
 
-        const auto& specPlot = water.GetSpectrumPlot();
-        if (!specPlot.empty())
+        // Per-cascade debug images: time-evolved spectrum h(k,t) (left) + heightfield (right).
+        // GPU textures shown via a per-frame SRV copied into the ImGui-bound transient heap.
+        ImGui::Spacing();
+        ImGui::TextDisabled("Spectrum h(k,t)      Heightfield   (per cascade)");
         {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Wave Spectrum  (|k| = 0..N/2,  total |h0| per ring)");
-            ImGui::PlotLines("##spectrum", specPlot.data(), (int)specPlot.size(),
-                             0, nullptr, 0.0f, FLT_MAX, ImVec2(-1, 80));
+            auto& th = m_renderer->GetTransientHeap();
+            const ImVec2 imgSize(104.0f, 104.0f);
+            for (int c = 0; c < 3; ++c)
+            {
+                // Images first (so the two columns align under the header), toggle in the right column.
+                D3D12_CPU_DESCRIPTOR_HANDLE specCpu = water.GetSpectrumVizSRV(c);
+                D3D12_CPU_DESCRIPTOR_HANDLE hgtCpu  = water.GetHeightVizSRV(c);
+                D3D12_GPU_DESCRIPTOR_HANDLE specGpu = th.CopyDescriptors(m_device.Get(), &specCpu, 1);
+                D3D12_GPU_DESCRIPTOR_HANDLE hgtGpu  = th.CopyDescriptors(m_device.Get(), &hgtCpu, 1);
+                ImGui::Image((ImTextureID)specGpu.ptr, imgSize);
+                ImGui::SameLine();
+                ImGui::Image((ImTextureID)hgtGpu.ptr, imgSize);
+                ImGui::SameLine();
+
+                // Right column: apply toggle + wavelength band label (shortest = 2·tile/N).
+                float tile = water.GetCascadeTileSize(c);
+                float shortLambda = 2.0f * tile / water.GetVizSize();
+                char lbl[48];
+                snprintf(lbl, sizeof(lbl), "C%d  %.2g-%.0f m##casc", c, shortLambda, tile);
+                ImGui::Checkbox(lbl, &tweaks.cascadeEnabled[c]);   // apply this cascade to the surface
+            }
+            ImGui::SliderFloat("Spectrum gain", &tweaks.spectrumVizGain, 0.1f, 500.0f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Height gain",   &tweaks.heightVizGain,   0.1f, 50.0f, "%.2f",
+                               ImGuiSliderFlags_Logarithmic);
         }
 
         ImGui::TextDisabled("FFT: %dx%d  Tile: %.1fm", desc.N, desc.M, desc.TileSize);
+
+        ImGui::SeparatorText("Buoyancy debug");
+        ImGui::Checkbox("Wave debug: green=buoyancy (CPU), magenta=GPU surface", &m_showWaveDebug);
+        ImGui::SliderFloat("Prop sink", &m_propSink, -2.0f, 2.0f, "%.2f");
     }
 
     ImGui::Separator();

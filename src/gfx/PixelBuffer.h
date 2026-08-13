@@ -9,14 +9,17 @@ class PixelBuffer : public GpuResource
 {
 public:
     void Create(ID3D12Device* device, DXGI_FORMAT format, UINT width, UINT height,
-                D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initialState);
+                D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initialState,
+                UINT mipLevels = 1);
 
     DXGI_FORMAT GetFormat() const { return m_format; }
     UINT        GetWidth()  const { return m_width;  }
     UINT        GetHeight() const { return m_height; }
+    UINT        GetMipLevels() const { return m_mipLevels; }
 
 private:
     DXGI_FORMAT m_format = DXGI_FORMAT_UNKNOWN;
     UINT        m_width  = 0;
     UINT        m_height = 0;
+    UINT        m_mipLevels = 1;
 };

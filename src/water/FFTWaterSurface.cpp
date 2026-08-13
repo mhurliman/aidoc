@@ -86,12 +86,15 @@ void FFTWaterSurface::Init(ID3D12Device* device, const WaterDesc& desc, ID3D12Co
     m_log2N = 0;
     while ((1 << m_log2N) < n)
         ++m_log2N;
+    m_gradMips = m_log2N + 1;   // full mip chain: N, N/2, …, 1
 
-    m_computeRootSig = LoadRootSig(m_device, "fft_compute_rs.cso");
-    m_renderRootSig  = LoadRootSig(m_device, "water_render_rs.cso");
+    m_computeRootSig    = LoadRootSig(m_device, "fft_compute_rs.cso");
+    m_downsampleRootSig = LoadRootSig(m_device, "downsample_rs.cso");
+    m_renderRootSig     = LoadRootSig(m_device, "water_render_rs.cso");
     CreatePSOs();
     CreateTextures();
     CreateDescriptorHeap();
+    m_vizSrvHeap.Init(m_device, (UINT)kNumCascades * 2);  // CPU SRVs for the debug images
     BuildDescriptorTables();
     tweaks.meshResolution = desc.MeshResolution;
     CreateMesh();
@@ -177,6 +180,8 @@ static ComPtr<ID3D12PipelineState> CreateComputePSO(ID3D12Device* device,
 void FFTWaterSurface::CreatePSOs()
 {
     PhillipsSpectrumPSO  = CreateComputePSO(m_device, m_computeRootSig.Get(), "phillips_spectrum_cs.cso");
+    DownsamplePSO        = CreateComputePSO(m_device, m_downsampleRootSig.Get(), "downsample_cs.cso");
+    VizPSO               = CreateComputePSO(m_device, m_downsampleRootSig.Get(), "water_viz_cs.cso");
     DynamicSpectrumPSO   = CreateComputePSO(m_device, m_computeRootSig.Get(), "dynamic_spectrum_cs.cso");
     PrecomputePSO        = CreateComputePSO(m_device, m_computeRootSig.Get(), "precompute_cs.cso");
     IFFTHorizonalStepPSO = CreateComputePSO(m_device, m_computeRootSig.Get(), "ifft_horz_cs.cso");
@@ -280,8 +285,14 @@ void FFTWaterSurface::CreateTextures()
         cs.gradFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
         cs.dispFreq.Create  (m_device, DXGI_FORMAT_R32G32_FLOAT, N, N, kUAV, kUAVState);
         cs.heightMap.Create (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
-        cs.gradMap.Create   (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+        // Gradient map carries a full mip chain (built each frame) so the PS can trilinear-sample
+        // averaged slopes at distance — anti-aliases the specular/reflection sparkle.
+        cs.gradMap.Create   (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState, (UINT)m_gradMips);
         cs.dispMap.Create   (m_device, DXGI_FORMAT_R32G32_FLOAT, N, M, kUAV, kUAVState);
+
+        // Debug visualization images (written by the viz compute pass, sampled by ImGui).
+        cs.vizSpectrum.Create(m_device, DXGI_FORMAT_R8G8B8A8_UNORM, N, N, kUAV, kUAVState);
+        cs.vizHeight.Create  (m_device, DXGI_FORMAT_R8G8B8A8_UNORM, N, N, kUAV, kUAVState);
 
         wchar_t name[64];
         swprintf_s(name, L"Water/C%d/Noise",      c); cs.noise.SetDebugName(name);
@@ -326,6 +337,29 @@ static void CreateUAV2D(ID3D12Device* device, const PixelBuffer& buf,
     D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
     d.Format        = buf.GetFormat();
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(buf.GetResource(), nullptr, &d, dest);
+}
+
+// SRV exposing the whole mip chain (for trilinear .Sample and .mips[] reads).
+static void CreateSRV2DAllMips(ID3D12Device* device, const PixelBuffer& buf,
+                               D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+    d.Format                  = buf.GetFormat();
+    d.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Texture2D.MipLevels     = buf.GetMipLevels();
+    device->CreateShaderResourceView(buf.GetResource(), &d, dest);
+}
+
+// UAV of a single mip level (mip-chain downsample writes one mip at a time).
+static void CreateUAV2DMip(ID3D12Device* device, const PixelBuffer& buf, UINT mip,
+                           D3D12_CPU_DESCRIPTOR_HANDLE dest)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
+    d.Format               = buf.GetFormat();
+    d.ViewDimension        = D3D12_UAV_DIMENSION_TEXTURE2D;
+    d.Texture2D.MipSlice   = mip;
     device->CreateUnorderedAccessView(buf.GetResource(), nullptr, &d, dest);
 }
 
@@ -410,11 +444,39 @@ void FFTWaterSurface::BuildDescriptorTables()
     // Render table: cascade maps grouped by type [all height][all grad][all disp],
     // then two per-frame scene slots (filled in Render()) + reflection cube.
     for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].heightMap, kRenderTable + 0 * kNumCascades + c);
-    for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].gradMap,   kRenderTable + 1 * kNumCascades + c);
+    // Gradient SRV exposes the whole mip chain so the PS trilinear-samples it (anti-aliasing).
+    for (int c = 0; c < kNumCascades; ++c)
+        CreateSRV2DAllMips(m_device, m_cascades[c].gradMap, CpuHandle(kRenderTable + 1 * kNumCascades + c));
     for (int c = 0; c < kNumCascades; ++c) S(&m_cascades[c].dispMap,   kRenderTable + 2 * kNumCascades + c);
     CreateNullSRV    (m_device, CpuHandle(kRenderSceneDepth));
     CreateNullSRV    (m_device, CpuHandle(kRenderSceneColor));
     CreateNullSRVCube(m_device, CpuHandle(kRenderEnvCube));
+
+    // Per-mip UAV views of each cascade's gradient map, for the downsample chain.
+    for (int c = 0; c < kNumCascades; ++c)
+        for (int m = 1; m < m_gradMips; ++m)
+            CreateUAV2DMip(m_device, m_cascades[c].gradMap, (UINT)m,
+                           CpuHandle(kMipGenBegin + c * kMaxGradMips + m));
+
+    // Viz: dest UAVs (shader-visible, for the viz dispatch) + CPU SRVs (for ImGui copy).
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        CreateUAV2D(m_device, m_cascades[c].vizSpectrum, CpuHandle(kVizBegin + c * 2 + 0));
+        CreateUAV2D(m_device, m_cascades[c].vizHeight,   CpuHandle(kVizBegin + c * 2 + 1));
+
+        UINT s0, s1;
+        CreateSRV2D(m_device, m_cascades[c].vizSpectrum, m_vizSrvHeap.Allocate(s0));
+        CreateSRV2D(m_device, m_cascades[c].vizHeight,   m_vizSrvHeap.Allocate(s1));
+    }
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE FFTWaterSurface::GetSpectrumVizSRV(int cascade) const
+{
+    return m_vizSrvHeap.GetCPUHandle((UINT)(cascade * 2 + 0));
+}
+D3D12_CPU_DESCRIPTOR_HANDLE FFTWaterSurface::GetHeightVizSRV(int cascade) const
+{
+    return m_vizSrvHeap.GetCPUHandle((UINT)(cascade * 2 + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +788,7 @@ void FFTWaterSurface::BuildSpectrumPlot()
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
     };
 
     const int binCount = halfN + 1;
@@ -783,7 +845,7 @@ float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsed
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
     };
 
     // Sum the low-frequency contribution of every cascade (matches the GPU render sum).
@@ -867,7 +929,7 @@ void FFTWaterSurface::SampleHeightGrid(float originX, float originZ, float cell,
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
     };
 
     const int GG = G * G;
@@ -960,7 +1022,7 @@ void FFTWaterSurface::SampleSurfaceGrid(float originX, float originZ, float cell
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * (kw * kw) * cutoff / (k2 * k2);
+        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
     };
 
     const int GG = G * G;
@@ -1209,19 +1271,21 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
     // Noise is already in NON_PIXEL_SHADER_RESOURCE state (uploaded synchronously in Init).
     {
         PhillipsParams currentParams = { tweaks.windTheta, tweaks.windSpeed,
-                                         tweaks.smallWaveCutoff, tweaks.amplitude };
+                                         tweaks.smallWaveCutoff, tweaks.amplitude,
+                                         tweaks.directionality };
         if (!cs.phillipsValid || !(currentParams == cs.lastPhillipsParams))
         {
             // h0 starts as UAV on first frame; on re-runs it's NPSR — transition back to UAV.
             ctx.TransitionResource(cs.h0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-            struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude; };
+            struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude, dirExponent; };
             auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
             memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
 
             auto globAlloc = alloc.Allocate(sizeof(PhillipsGlobals));
             PhillipsGlobals globals = { tweaks.windTheta, tweaks.windSpeed,
-                                        tweaks.smallWaveCutoff, tweaks.amplitude };
+                                        tweaks.smallWaveCutoff, tweaks.amplitude,
+                                        tweaks.directionality };
             memcpy(globAlloc.cpuAddress, &globals, sizeof(globals));
 
             cmd->SetComputeRootSignature(m_computeRootSig.Get());
@@ -1246,6 +1310,8 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
     ctx.TransitionResource(cs.heightMap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ctx.TransitionResource(cs.gradMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ctx.TransitionResource(cs.dispMap,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // heightFreq is left NPSR by last frame's graphics viz read — reclaim it for the write below.
+    ctx.TransitionResource(cs.heightFreq, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // ---- Dynamic spectrum (per-frame) ----
     {
@@ -1360,12 +1426,140 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
         ctx.TransitionResource(*ch.srcFreq,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
+    // Build the gradient-map mip chain (leaves gradMap all-NPSR) for anti-aliased distant normals.
+    GenerateGradientMips(ctx, alloc, cs);
+
     // ---- Transition final maps to NPSR for cross-queue handoff ----
     // PIXEL_SHADER_RESOURCE is invalid on compute queues; Render() adds the PSR bit
-    // on the graphics queue before drawing.
+    // on the graphics queue before drawing. (gradMap is already NPSR from the mip pass.)
     ctx.TransitionResource(cs.heightMap, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ctx.TransitionResource(cs.gradMap,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     ctx.TransitionResource(cs.dispMap,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+// Box-downsample gradMap mip 0 → 1 → … using per-subresource barriers: each source mip is moved to
+// NPSR and read via the all-mip SRV (.mips[SrcMip]) while the next mip is written as a UAV. Leaves
+// every subresource in NON_PIXEL_SHADER_RESOURCE.
+void FFTWaterSurface::GenerateGradientMips(CommandContext& ctx, LinearAllocator& alloc, Cascade& cs)
+{
+    if (m_gradMips <= 1) return;
+
+    auto* cmd = ctx.GetCommandList();
+    const int c = (int)(&cs - &m_cascades[0]);
+    ID3D12Resource* res = cs.gradMap.GetResource();
+    const UINT srvSlot = (UINT)(kRenderTable + 1 * kNumCascades + c);  // all-mip gradient SRV
+
+    ctx.FlushResourceBarriers();  // drain any batched barriers before raw per-subresource ones
+    cmd->SetComputeRootSignature(m_downsampleRootSig.Get());
+    ctx.SetPipelineState(DownsamplePSO.Get());
+
+    struct DSParams { uint32_t SrcMip, DstW, DstH, Pad; };
+
+    for (int m = 1; m < m_gradMips; ++m)
+    {
+        // Source mip (m-1): UAV → NPSR so it can be read via the SRV.
+        D3D12_RESOURCE_BARRIER toRead = {};
+        toRead.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toRead.Transition.pResource   = res;
+        toRead.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        toRead.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        toRead.Transition.Subresource = (UINT)(m - 1);
+        cmd->ResourceBarrier(1, &toRead);
+
+        UINT dstW = (UINT)std::max(1, m_desc.N >> m);
+        UINT dstH = (UINT)std::max(1, m_desc.M >> m);
+
+        auto cb = alloc.Allocate(sizeof(DSParams));
+        DSParams p = { (uint32_t)(m - 1), dstW, dstH, 0 };
+        memcpy(cb.cpuAddress, &p, sizeof(p));
+
+        cmd->SetComputeRootConstantBufferView(0, cb.gpuAddress);
+        cmd->SetComputeRootDescriptorTable(1, GpuHandle(srvSlot));                          // src (all mips)
+        cmd->SetComputeRootDescriptorTable(2, GpuHandle((UINT)(kMipGenBegin + c * kMaxGradMips + m))); // dst mip m
+        cmd->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
+
+        // Ensure this mip's write completes before it's read as the next source.
+        D3D12_RESOURCE_BARRIER uavB = {};
+        uavB.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavB.UAV.pResource = res;
+        cmd->ResourceBarrier(1, &uavB);
+    }
+
+    // Final mip is still UAV — move it to NPSR so the whole resource is uniform again.
+    D3D12_RESOURCE_BARRIER last = {};
+    last.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    last.Transition.pResource   = res;
+    last.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    last.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    last.Transition.Subresource = (UINT)(m_gradMips - 1);
+    cmd->ResourceBarrier(1, &last);
+
+    cs.gradMap.SetCurrentState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+// ---------------------------------------------------------------------------
+// Debug visualization: render each cascade's time-evolved spectrum + heightfield into small
+// RGBA textures the UI samples. Runs on the graphics queue (compute dispatch on the direct list),
+// so the display textures cycle PSR→UAV→PSR entirely on one queue — no cross-queue handoff.
+// ---------------------------------------------------------------------------
+void FFTWaterSurface::RenderViz(GraphicsContext& ctx, LinearAllocator& alloc)
+{
+    auto* cmd = ctx.GetCommandList();
+    const int  N      = m_desc.N;
+    const UINT groups = (UINT)((N + 7) / 8);
+
+    // Sources readable, destinations writable.
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        // heightFreq still holds h(k,t) (IFFT read it, didn't overwrite). Reclaimed to UAV next
+        // frame by DynamicSpectrum. heightMap is already NPSR/PSR-readable from Update/Render.
+        ctx.TransitionResource(m_cascades[c].heightFreq,  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ctx.TransitionResource(m_cascades[c].vizSpectrum, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ctx.TransitionResource(m_cascades[c].vizHeight,   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    ctx.FlushResourceBarriers();
+
+    ctx.SetDescriptorHeap(m_heap.Get());
+    cmd->SetComputeRootSignature(m_downsampleRootSig.Get());
+    ctx.SetPipelineState(VizPSO.Get());
+
+    struct VizParams { uint32_t Mode, N; float Scale; uint32_t Pad; };
+
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        const Cascade& cs = m_cascades[c];
+
+        // Time-evolved spectrum: src = heightFreq SRV (initHeightTable slot 1), dst = vizSpectrum.
+        {
+            auto cb = alloc.Allocate(sizeof(VizParams));
+            VizParams p = { 0u, (uint32_t)N, tweaks.spectrumVizGain, 0u };
+            memcpy(cb.cpuAddress, &p, sizeof(p));
+            cmd->SetComputeRootConstantBufferView(0, cb.gpuAddress);
+            cmd->SetComputeRootDescriptorTable(1, GpuHandle(cs.initHeightTable + 1));
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle((UINT)(kVizBegin + c * 2 + 0)));
+            cmd->Dispatch(groups, groups, 1);
+        }
+        // Heightfield: src = heightMap render SRV, dst = vizHeight.
+        {
+            auto cb = alloc.Allocate(sizeof(VizParams));
+            VizParams p = { 1u, (uint32_t)N, tweaks.heightVizGain, 0u };
+            memcpy(cb.cpuAddress, &p, sizeof(p));
+            cmd->SetComputeRootConstantBufferView(0, cb.gpuAddress);
+            cmd->SetComputeRootDescriptorTable(1, GpuHandle((UINT)(kRenderTable + 0 * kNumCascades + c)));
+            cmd->SetComputeRootDescriptorTable(2, GpuHandle((UINT)(kVizBegin + c * 2 + 1)));
+            cmd->Dispatch(groups, groups, 1);
+        }
+    }
+
+    // Promote the images to PSR so ImGui can sample them later this frame.
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        ctx.UAVBarrier(m_cascades[c].vizSpectrum);
+        ctx.UAVBarrier(m_cascades[c].vizHeight);
+        ctx.TransitionResource(m_cascades[c].vizSpectrum, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ctx.TransitionResource(m_cascades[c].vizHeight,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    ctx.FlushResourceBarriers();
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,10 +1616,12 @@ void FFTWaterSurface::Render(GraphicsContext& ctx, LinearAllocator& alloc, const
     wcBase.ColorMax = XMFLOAT4(tweaks.color.x, tweaks.color.y, tweaks.color.z,
                                tweaks.maxTessellation);
     // CascTess.xyz = 1/tileSize per cascade (drives sample UV + amplitude scale); w = tess distance.
-    wcBase.CascTess = XMFLOAT4(1.0f / m_cascades[0].tileSize,
-                               kNumCascades > 1 ? 1.0f / m_cascades[1].tileSize : 0.0f,
-                               kNumCascades > 2 ? 1.0f / m_cascades[2].tileSize : 0.0f,
-                               tweaks.tessDistance);
+    // A disabled cascade uses rcp = 0, which zeroes its displacement/height/gradient contribution.
+    auto rcpOf = [&](int c) {
+        return (c < kNumCascades && tweaks.cascadeEnabled[c]) ? 1.0f / m_cascades[c].tileSize : 0.0f;
+    };
+    wcBase.CascTess = XMFLOAT4(rcpOf(0), rcpOf(1), rcpOf(2), tweaks.tessDistance);
+    wcBase.Extra    = XMFLOAT4(tweaks.ambient, 0.0f, 0.0f, 0.0f);
 
     ctx.SetDescriptorTable(2, GpuHandle(kRenderTable));
     ctx.SetDescriptorTable(3, GpuHandle(kRenderSceneDepth));

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(aidoc LANGUAGES CXX)
+project(WaveSim LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/assets/Texture.cpp
     src/assets/Material.cpp
     src/assets/Mesh.cpp
+    src/assets/ObjLoader.cpp
     src/scene/Scene.cpp
     src/assets/ResourceManager.cpp
     src/water/FFTWaterSurface.cpp
@@ -92,7 +93,7 @@ message(STATUS "Using nethost from: ${NETHOST_DIR}")
 target_include_directories(${PROJECT_NAME} PRIVATE ${NETHOST_DIR})
 target_link_libraries(${PROJECT_NAME} PRIVATE "${NETHOST_DIR}/nethost.lib")
 
-# Build Sim.Host (C#) alongside aidoc, and copy its managed assemblies next to the exe.
+# Build Sim.Host (C#) alongside WaveSim, and copy its managed assemblies next to the exe.
 set(SAILBOAT_SIM_DIR "${CMAKE_SOURCE_DIR}/../sailboat-sim"
     CACHE PATH "Path to the sailboat-sim repo (provides the Sim.Host physics DLL)")
 set(SIM_HOST_PROJECT "${SAILBOAT_SIM_DIR}/src/Sim.Host/Sim.Host.csproj")
@@ -167,6 +168,7 @@ endforeach()
 set(RS_SOURCES
     "PbrRootSig.hlsl|pbr_rs"
     "FFT/FFTRootSig.hlsl|fft_compute_rs"
+    "FFT/DownsampleRootSig.hlsl|downsample_rs"
     "Water/WaterRenderRootSig.hlsl|water_render_rs"
 )
 foreach(RS_ENTRY ${RS_SOURCES})
@@ -196,6 +198,8 @@ set(COMPUTE_SHADERS
     "FFT/IFFTHorz.hlsl|ifft_horz_cs|main"
     "FFT/IFFTVert.hlsl|ifft_vert_cs|main"
     "FFT/Permute.hlsl|permute_cs|main"
+    "FFT/Downsample.hlsl|downsample_cs|main"
+    "FFT/WaterViz.hlsl|water_viz_cs|main"
     "utils/CopyTexture2D.hlsl|copy_texture_cs|main"
 )
 

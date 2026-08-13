@@ -12,6 +12,7 @@
 #include "gfx/LinearAllocator.h"
 #include "gfx/PixelBuffer.h"
 #include "gfx/GpuBuffer.h"
+#include "gfx/DescriptorHeap.h"
 #include "IRenderer.h"
 
 using Microsoft::WRL::ComPtr;
@@ -33,6 +34,7 @@ public:
         float windTheta       = 0.0f;   // radians, direction wind blows toward
         float amplitude       = 0.1f;
         float smallWaveCutoff = 0.01f;
+        float directionality  = 1.0f;   // exponent on (k̂·ŵ)²; higher = waves align tighter to wind
         float choppiness      = 0.5f;   // λ: horizontal displacement scale [0,1]
         float timeScale       = 0.5f;   // slows or speeds up wave animation
         float maxTessellation = 32.0f;  // peak tessellation factor near camera
@@ -43,6 +45,10 @@ public:
         int   tileCount       = 3;      // tiles per side; 1=single, 3=3×3 grid, etc.
         int   meshResolution  = 32;     // base grid vertices per side (runtime-changeable)
         bool  tessellation    = true;   // use HS/DS tessellation; false = plain VS + triangle list
+        float spectrumVizGain = 20.0f;  // debug-image tone-map gain for the spectrum thumbnail
+        float heightVizGain   = 2.0f;   // debug-image gain for the heightfield thumbnail
+        bool  cascadeEnabled[3] = { true, true, true };  // per-cascade apply toggle (render only)
+        float ambient         = 0.5f;   // sky-dome ambient fill on the water body
     };
 
     WaterTweaks tweaks;
@@ -127,6 +133,16 @@ public:
     // Rebuilt automatically whenever Phillips parameters change.
     const std::vector<float>& GetSpectrumPlot() const { return m_spectrumPlot; }
 
+    // Debug-image visualization: render the time-evolved spectrum + heightfield of each cascade into
+    // small textures. Call from the graphics pass (after PrepareForCompute'd maps are re-promoted in
+    // Render) so the images end in PIXEL_SHADER_RESOURCE for ImGui to sample.
+    void RenderViz(GraphicsContext& ctx, LinearAllocator& alloc);
+    int   GetVizSize() const { return m_desc.N; }
+    float GetCascadeTileSize(int c) const { return m_cascades[c].tileSize; }
+    // CPU (non-shader-visible) SRV handles for ImGui — copy into a shader-visible heap per frame.
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSpectrumVizSRV(int cascade) const;
+    D3D12_CPU_DESCRIPTOR_HANDLE GetHeightVizSRV(int cascade) const;
+
     // Demote displacement maps from PSR|NPSR back to NPSR on the graphics command list.
     // Call at end of every graphics frame before the next frame's async compute runs.
     void PrepareForCompute(CommandContext& ctx);
@@ -156,6 +172,7 @@ private:
         DirectX::XMFLOAT4X4 WorldViewProjMat;
         DirectX::XMFLOAT4   ColorMax;   // xyz = Color, w = MaxTessellation
         DirectX::XMFLOAT4   CascTess;   // xyz = 1/tileSize per cascade, w = TessDistance
+        DirectX::XMFLOAT4   Extra;      // x = sky ambient strength
     };
 
     // Matches WaterCommon.hlsli FrameConstants
@@ -179,11 +196,12 @@ private:
 
     struct PhillipsParams
     {
-        float windTheta, windSpeed, smallWaveCutoff, amplitude;
+        float windTheta, windSpeed, smallWaveCutoff, amplitude, directionality;
         bool operator==(const PhillipsParams& o) const
         {
             return windTheta == o.windTheta && windSpeed == o.windSpeed
-                && smallWaveCutoff == o.smallWaveCutoff && amplitude == o.amplitude;
+                && smallWaveCutoff == o.smallWaveCutoff && amplitude == o.amplitude
+                && directionality == o.directionality;
         }
     };
 
@@ -203,6 +221,9 @@ private:
         PixelBuffer gradMap;     // R32G32_FLOAT       NxN  UAV→SRV (final gradient)
         PixelBuffer dispMap;     // R32G32_FLOAT       NxN  UAV→SRV (final displacement)
 
+        PixelBuffer vizSpectrum; // R8G8B8A8_UNORM     NxN  debug image of h(k,t)
+        PixelBuffer vizHeight;   // R8G8B8A8_UNORM     NxN  debug image of the heightfield
+
         ComPtr<ID3D12Resource>             noiseUpload;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT noiseFootprint = {};
         std::vector<DirectX::XMFLOAT2>     noiseCpu;  // CPU mirror for buoyancy
@@ -219,6 +240,10 @@ private:
     // Runs Phillips + DynamicSpectrum + IFFT + Permute for one cascade.
     void RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc, Cascade& cs, float simTime);
 
+    // Box-downsample the cascade's gradient map into its full mip chain (per-subresource barriers),
+    // so the pixel shader can trilinear-sample averaged slopes at distance (anti-aliasing).
+    void GenerateGradientMips(CommandContext& ctx, LinearAllocator& alloc, Cascade& cs);
+
     D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle(UINT slot) const;
     D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT slot) const;
 
@@ -232,6 +257,7 @@ private:
 
     ComPtr<ID3D12RootSignature> m_computeRootSig;
     ComPtr<ID3D12RootSignature> m_renderRootSig;
+    ComPtr<ID3D12RootSignature> m_downsampleRootSig;
 
     // Compute PSOs (FFT pipeline)
     ComPtr<ID3D12PipelineState> PhillipsSpectrumPSO;
@@ -240,6 +266,8 @@ private:
     ComPtr<ID3D12PipelineState> IFFTHorizonalStepPSO;
     ComPtr<ID3D12PipelineState> IFFTVerticalStepPSO;
     ComPtr<ID3D12PipelineState> PermutePSO;
+    ComPtr<ID3D12PipelineState> DownsamplePSO;   // gradient-map mip-chain generation
+    ComPtr<ID3D12PipelineState> VizPSO;          // spectrum/heightfield debug images
 
     // Graphics PSOs — tessellated (HS+DS) and flat (VS-only) variants
     ComPtr<ID3D12PipelineState> WaterRenderPSO;
@@ -255,6 +283,10 @@ private:
 
     CpuHeightfield m_heightfield;
 
+    // CPU-only SRV heap holding the viz display-texture SRVs (2 per cascade), copied into the
+    // shader-visible transient heap each frame for ImGui.
+    PersistentDescriptorHeap m_vizSrvHeap;
+
     // Environment cube map (reflection).
     ComPtr<ID3D12Resource>      m_envCubeMap;
     ComPtr<ID3D12Resource>      m_envCubeUpload;  // kept alive until GPU upload finishes
@@ -268,6 +300,7 @@ private:
 
     bool m_precomputeDone     = false;  // twiddle factors only (shared, depends only on N)
     int  m_lastMeshResolution = 0;
+    int  m_gradMips           = 1;      // mip levels in each cascade's gradient map (log2(N)+1)
 
     std::vector<float> m_spectrumPlot;  // size N/2+1; cascade 0 (swell), rebuilt on param change
     void BuildSpectrumPlot();
@@ -302,6 +335,12 @@ private:
         kRenderEnvCube    = kRenderTable + kRenderMapCount + 2,  // +11
         kRenderShadow     = kRenderTable + kRenderMapCount + 3,  // +12  (cascaded shadow array)
 
-        kHeapSlotCount   = 192,
+        // Per-cascade gradient-map mip UAV views (one per dest mip; mip m at base + c*stride + m).
+        kMaxGradMips     = 13,
+        kMipGenBegin     = 192,
+
+        // Per-cascade viz dest UAVs: spectrum at kVizBegin + c*2, heightfield at kVizBegin + c*2 + 1.
+        kVizBegin        = kMipGenBegin + kNumCascades * kMaxGradMips,  // 231
+        kHeapSlotCount   = kVizBegin + kNumCascades * 2,               // 237
     };
 };

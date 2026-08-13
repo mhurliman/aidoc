@@ -319,6 +319,9 @@ void Renderer::RenderScene(Scene& scene, const View& view,
     UINT64 computeVal = m_computeContext.Finish(m_computeFence.Get(), m_nextComputeFenceValue);
     m_graphicsQueue->Wait(m_computeFence.Get(), computeVal);
 
+    // Build the spectrum/heightfield debug images (graphics queue) for the ImGui panel.
+    water.RenderViz(m_gfxContext, m_linearAllocator);
+
     // -------------------------------------------------------------------------
     // Shadow depth pass — render casters (hull + rig) into every cascade.
     // -------------------------------------------------------------------------

@@ -4,7 +4,8 @@
 ConstantBuffer<FrameConstants> Frame : register(b0);
 ConstantBuffer<WaterConstants> Water : register(b1);
 
-// Gradient (slope) maps, one per cascade — used to reconstruct the surface normal per-pixel.
+// Gradient (slope) maps per cascade — reconstruct the per-pixel normal.
+// Bound in the shared t0..t8 table (visibility ALL).
 Texture2D<float2>   GradientMap[NUM_CASCADES] : register(t3);
 Texture2D<float>    SceneDepth     : register(t9);
 Texture2D<float4>   SceneColor     : register(t10);
@@ -20,6 +21,20 @@ cbuffer ShadowConstants : register(b2)
     float4x4 cascadeViewProj[3];
     float4   shadowParams;   // x = texel size, y = depth bias, z = cascade count, w = enabled
 };
+
+static const float PI = 3.14159265;
+
+// ---- Tunables (shader-local; promote to a cbuffer if UI control is wanted) ----
+static const float kRefractPixels   = 28.0;   // max refraction offset in pixels
+static const float kSpecScale        = 6.0e-4; // GGX sun-glint magnitude
+static const float kRoughNear        = 0.03;   // wave roughness up close
+static const float kRoughFar         = 0.40;   // wave roughness at the horizon (kills sparkle)
+static const float kRoughFarDist     = 300.0;  // metres over which roughness ramps to kRoughFar
+
+float LinearizeDepth(float d)
+{
+    return Frame.NearZ * Frame.FarZ / (Frame.FarZ - d * (Frame.FarZ - Frame.NearZ));
+}
 
 // Sun visibility [0,1] at a world position (PCF 3x3). 1 = lit, 0 = shadowed.
 float ComputeSunShadow(float3 worldPos)
@@ -44,63 +59,136 @@ float ComputeSunShadow(float3 worldPos)
     return sum / 9.0;
 }
 
-// Converts an NDC depth sample to linear view-space distance (metres).
-// Valid for a standard left-handed projection (near -> 0, far -> 1).
-float LinearizeDepth(float d)
+// Project a world point to screen UV via the view-proj (same matrix the DS uses). Returns false
+// if behind the camera. Fills ndcZ with the point's NDC depth.
+bool WorldToUV(float3 P, out float2 uv, out float ndcZ)
 {
-    return Frame.NearZ * Frame.FarZ / (Frame.FarZ - d * (Frame.FarZ - Frame.NearZ));
+    float4 clip = mul(float4(P, 1.0), Water.WorldViewProjMat);
+    uv = 0; ndcZ = 0;
+    if (clip.w <= 1e-4) return false;
+    float3 ndc = clip.xyz / clip.w;
+    uv   = ndc.xy * float2(0.5, -0.5) + 0.5;
+    ndcZ = ndc.z;
+    return true;
+}
+
+// Screen-space reflection: march the reflection ray in world space, project into the depth
+// buffer, and return the scene colour where it first passes behind on-screen geometry. Sky
+// (far depth) and off-screen rays return confidence 0 so the caller falls back to the cubemap.
+float3 ScreenSpaceReflection(float3 origin, float3 dir, out float confidence)
+{
+    confidence = 0.0;
+    float3 P = origin;
+    float  step = 0.3;                 // metres; grows geometrically to cover ~90 m in 28 steps
+    [loop] for (int i = 0; i < 28; ++i)
+    {
+        float3 prev = P;
+        P += dir * step;
+        step *= 1.15;
+
+        float2 uv; float rayZ;
+        if (!WorldToUV(P, uv, rayZ)) return 0;
+        if (any(uv < 0.0) || any(uv > 1.0)) return 0;      // left the screen → cubemap
+
+        float sceneZ = SceneDepth.SampleLevel(LinearSampler, uv, 0);
+        if (sceneZ >= 0.9999) continue;                    // sky → let the cubemap handle it
+
+        if (rayZ > sceneZ)                                 // ray passed behind geometry
+        {
+            float rayLin = LinearizeDepth(rayZ);
+            float scnLin = LinearizeDepth(sceneZ);
+            if (rayLin - scnLin < step * 3.0 + 0.5)        // plausible surface, not a far gap
+            {
+                // Binary refine between the last-in-front and first-behind samples.
+                float3 a = prev, b = P;
+                [unroll] for (int r = 0; r < 5; ++r)
+                {
+                    float3 m = (a + b) * 0.5;
+                    float2 mu; float mz; WorldToUV(m, mu, mz);
+                    float sd = SceneDepth.SampleLevel(LinearSampler, mu, 0);
+                    if (mz > sd) b = m; else a = m;
+                }
+                float2 hu; float hz; WorldToUV(b, hu, hz);
+                float2 edge = smoothstep(0.0, 0.12, hu) * smoothstep(0.0, 0.12, 1.0 - hu);
+                confidence = edge.x * edge.y;
+                return SceneColor.SampleLevel(LinearSampler, hu, 0).rgb;
+            }
+        }
+    }
+    return 0;
 }
 
 [RootSignature(ROOTSIG)]
 float4 PSMain(PSInput Input) : SV_Target
 {
-    uint2  PixelCoords = uint2(Input.PositionH.xy);
-    float  Depth       = Input.PositionH.z;
+    float Depth = Input.PositionH.z;
 
-    // Reconstruct the normal per-pixel from the summed cascade gradients. Sampling the
-    // slope maps here (rather than interpolating a vertex normal) avoids the triangle-edge
-    // specular faceting that a razor-sharp highlight otherwise exposes.
+    // Per-pixel normal from the summed cascade gradients.
     float2 Gradient = float2(0, 0);
     [unroll] for (int c = 0; c < NUM_CASCADES; ++c)
     {
         float rcp = Water.CascTess[c];
         Gradient += GradientMap[c].Sample(LinearSampler, Input.UndispXZ * rcp) * (rcp * 0.5);
     }
-    float3 Normal      = normalize(float3(-Gradient.x, 1.0, -Gradient.y));
-    float3 L           = normalize(-Frame.LightDirection);
+    float3 Normal = normalize(float3(-Gradient.x, 1.0, -Gradient.y));
+    float3 L      = normalize(-Frame.LightDirection);
 
-    float  BGDepth  = SceneDepth[PixelCoords];
-    float3 BGColor  = SceneColor[PixelCoords].rgb;
+    float3 ViewDir    = normalize(Input.PositionW - Frame.CameraPosition); // toward surface
+    float3 V          = -ViewDir;                                          // toward camera
+    float3 ReflectDir = reflect(ViewDir, Normal);
 
-    // Linearize to metric depth before differencing; NDC subtraction is meaningless.
+    // ---- Refraction: bend the background sample by the surface slope (Snell-ish) ----
+    uint  sw, sh; SceneColor.GetDimensions(sw, sh);
+    float2 invRes  = 1.0 / float2(sw, sh);
+    float2 baseUV  = (Input.PositionH.xy) * invRes;
+    float2 bentUV  = saturate(baseUV + Normal.xz * kRefractPixels * invRes);
+    float  BGDepth = SceneDepth.SampleLevel(LinearSampler, bentUV, 0);
+    float3 BGColor = SceneColor.SampleLevel(LinearSampler, bentUV, 0).rgb;
+    // Reject bends that pull in geometry in FRONT of the water (foreground bleed).
+    if (BGDepth < Depth)
+    {
+        BGDepth = SceneDepth.SampleLevel(LinearSampler, baseUV, 0);
+        BGColor = SceneColor.SampleLevel(LinearSampler, baseUV, 0).rgb;
+    }
+
     float WaterLen = max(LinearizeDepth(BGDepth) - LinearizeDepth(Depth), 0.0);
     float3 DiffuseColor = lerp(Water.ColorMax.rgb, BGColor, exp(-WaterLen * 5.0));
 
-    float3 ViewDir    = normalize(Input.PositionW - Frame.CameraPosition); // incident (toward surface)
-    float3 V          = -ViewDir;                                           // toward camera
-    float3 ReflectDir = reflect(ViewDir, Normal);
-
-    // Schlick Fresnel
+    // Schlick Fresnel.
     float Fresnel = 0.02 + 0.98 * pow(1.0 - max(0, dot(V, Normal)), 5.0);
 
-    float3 EnvColor = ReflectionMap.Sample(LinearSampler, ReflectDir).rgb;
+    // Sky-dome ambient (zenith of the atmosphere cubemap) — diffuse skylight on the water.
+    float3 SkyAmbient = ReflectionMap.Sample(LinearSampler, float3(0.0, 1.0, 0.0)).rgb;
 
-    // The atmosphere cubemap only holds the upper hemisphere (lower half is black).
-    // Reflection rays pointing below the horizon — common on the back faces of waves —
-    // would sample that black region. Substitute a deep-water tint (the attenuated colour
-    // of light within the water body) so back faces read as water rather than voids.
-    float3 UnderwaterColor = Water.ColorMax.rgb * 0.6;
-    EnvColor = lerp(UnderwaterColor, EnvColor, smoothstep(-0.05, 0.15, ReflectDir.y));
+    // ---- Reflection: sky cubemap, overlaid with screen-space reflections of on-screen geometry ----
+    float3 sky = ReflectionMap.Sample(LinearSampler, ReflectDir).rgb;
+    // Below-horizon rays hit the (black) lower hemisphere → substitute a deep-water tint lifted by
+    // skylight so grazing wave backs read as lit water rather than black voids.
+    float3 UnderwaterColor = Water.ColorMax.rgb * 0.5 + SkyAmbient * 0.2;
+    sky = lerp(UnderwaterColor, sky, smoothstep(-0.05, 0.15, ReflectDir.y));
 
-    // Cascaded shadow from the boat/rig onto the sea. Darkens the sun-lit diffuse + specular, and
-    // dims the reflection a little so the shadow still reads at grazing angles.
-    float  Sun      = ComputeSunShadow(Input.PositionW);
-    float  Specular = pow(max(0, dot(reflect(-L, Normal), V)), 720.0) * 210.0 * Sun;
+    float  ssrConf;
+    float3 ssr = ScreenSpaceReflection(Input.PositionW + Normal * 0.05, ReflectDir, ssrConf);
+    float3 EnvColor = lerp(sky, ssr, ssrConf);
 
-    float  NDotL      = max(0.5, dot(Normal, L));
-    float  Shade      = lerp(0.28, 1.0, Sun);   // shadowed water keeps some ambient, not black
-    EnvColor         *= lerp(0.75, 1.0, Sun);
-    float3 FinalColor = lerp(DiffuseColor * NDotL * Shade, EnvColor + Specular, Fresnel);
+    // ---- Sun shadow, GGX glitter (roughness grows with distance to kill horizon sparkle) ----
+    float Sun  = ComputeSunShadow(Input.PositionW);
+    float dist = length(Input.PositionW - Frame.CameraPosition);
+    float rough = lerp(kRoughNear, kRoughFar, saturate(dist / kRoughFarDist));
+    float a2   = rough * rough; a2 *= a2;
+    float3 H   = normalize(L + V);
+    float NoH  = saturate(dot(Normal, H));
+    float denom = NoH * NoH * (a2 - 1.0) + 1.0;
+    float Dggx = a2 / (PI * denom * denom);
+    float Specular = min(Dggx * kSpecScale, 4.0) * Sun;
+
+    float  NDotL = max(0.5, dot(Normal, L));
+    float  Shade = lerp(0.28, 1.0, Sun);   // shadowed water keeps some ambient
+    EnvColor    *= lerp(0.75, 1.0, Sun);
+
+    // Sun diffuse + sky-dome ambient fill (ambient isn't shadowed by the sun occluder).
+    float3 Body = DiffuseColor * (NDotL * Shade + SkyAmbient * Water.Extra.x);
+    float3 FinalColor = lerp(Body, EnvColor + Specular, Fresnel);
 
     return float4(FinalColor, 1.0);
 }

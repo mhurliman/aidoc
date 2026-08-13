@@ -60,6 +60,7 @@ struct WaterConstants
 
     float4 ColorMax;   // xyz = Color, w = MaxTessellation
     float4 CascTess;   // xyz = 1/tileSize per cascade, w = TessDistance
+    float4 Extra;      // x = sky ambient strength
 };
 
 #endif
