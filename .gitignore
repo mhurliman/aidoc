@@ -6,6 +6,8 @@ cmake-build-*/
 # Compiled objects
 *.o
 *.obj
+# Keep 3D model OBJs (the *.obj rule above is for compiler objects)
+!models/*.obj
 *.pdb
 *.ilk
 *.exp
