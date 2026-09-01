@@ -1,0 +1,3 @@
+[submodule "external/sailboat-sim"]
+	path = external/sailboat-sim
+	url = https://github.com/sail-smart/sailboat-sim.git
