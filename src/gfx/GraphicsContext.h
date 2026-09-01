@@ -27,4 +27,8 @@ public:
     
     void DrawIndexedInstanced(UINT indexCount, UINT instanceCount, UINT startIndex, INT baseVertex,
                               UINT startInstance);
+
+    // Non-indexed, for geometry a shader derives from SV_VertexID / SV_InstanceID rather than reads
+    // from a buffer.
+    void DrawInstanced(UINT vertexCount, UINT instanceCount, UINT startVertex, UINT startInstance);
 };

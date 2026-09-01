@@ -70,6 +70,13 @@ target_compile_options(${PROJECT_NAME} PRIVATE /GR-)
 # Prevent <windows.h> from defining min()/max() macros that collide with std::min/std::max.
 target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
 
+# D3D12 GPU-based validation. Off by default because it costs ~11 ms a frame in this scene, which
+# is most of a Debug frame budget; the ordinary debug layer is unaffected and stays on in Debug.
+option(GPU_BASED_VALIDATION "Enable D3D12 GPU-based validation in Debug builds (very slow)" OFF)
+if(GPU_BASED_VALIDATION)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_GPU_BASED_VALIDATION)
+endif()
+
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.h)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -78,33 +85,111 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     nlohmann_json::nlohmann_json
 )
 
-# ------------------------------------------------------------------------------------------------
-# .NET hosting: embed the C# physics sim (Sim.Host.dll from the sailboat-sim repo) via nethost.
-# ------------------------------------------------------------------------------------------------
-file(GLOB NETHOST_NATIVE_DIRS
-    "C:/Program Files/dotnet/packs/Microsoft.NETCore.App.Host.win-x64/*/runtimes/win-x64/native")
-if(NOT NETHOST_NATIVE_DIRS)
-    message(FATAL_ERROR "nethost pack not found. Install the .NET SDK (win-x64 host pack).")
+# The sim lives in this repo as a git submodule; override the cache entry only to build against
+# a checkout somewhere else.
+set(SAILBOAT_SIM_DIR "${CMAKE_SOURCE_DIR}/external/sailboat-sim"
+    CACHE PATH "Path to the sailboat-sim repo (provides the native sim client library)")
+
+# An uninitialised submodule is an empty directory, which would otherwise surface much later as a
+# confusing "project file does not exist" from dotnet partway through the build.
+if(NOT EXISTS "${SAILBOAT_SIM_DIR}/src/Sim.Core/Sim.Core.csproj")
+    message(FATAL_ERROR
+        "sailboat-sim not found at ${SAILBOAT_SIM_DIR} - the sim is a git submodule. "
+        "Initialise it with: git submodule update --init --recursive")
 endif()
-list(SORT NETHOST_NATIVE_DIRS)
-list(GET NETHOST_NATIVE_DIRS -1 NETHOST_DIR)   # newest version
-message(STATUS "Using nethost from: ${NETHOST_DIR}")
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${NETHOST_DIR})
-target_link_libraries(${PROJECT_NAME} PRIVATE "${NETHOST_DIR}/nethost.lib")
+# ------------------------------------------------------------------------------------------------
+# The sim's native client library: Sim.Net.Client publishes under NativeAOT to one shared library
+# exporting the sim_view_* / sim_client_* C ABI. SimClient.h is the authoritative contract; see
+# external/sailboat-sim/docs/engine-integration.md.
+# ------------------------------------------------------------------------------------------------
+set(SIM_NATIVE_RID "win-x64" CACHE STRING
+    "Runtime identifier to publish the sim's native client library for")
 
-# Build Sim.Host (C#) alongside WaveSim, and copy its managed assemblies next to the exe.
-set(SAILBOAT_SIM_DIR "${CMAKE_SOURCE_DIR}/../sailboat-sim"
-    CACHE PATH "Path to the sailboat-sim repo (provides the Sim.Host physics DLL)")
-set(SIM_HOST_PROJECT "${SAILBOAT_SIM_DIR}/src/Sim.Host/Sim.Host.csproj")
-set(SIM_HOST_OUTPUT_DIR "${SAILBOAT_SIM_DIR}/src/Sim.Host/bin/$<CONFIG>/net9.0")
+# The sim is published Release even for a Debug renderer, and that is a deliberate 14x: a Debug
+# NativeAOT build steps in 3.46 ms against 0.24 ms optimised (measured), and at 400 Hz the frame
+# loop cannot afford it - it burns the whole per-frame step budget and the boat sails in slow
+# motion while the display sits at ~10 fps. You debug this renderer, not the sim, so the dependency
+# stays optimised. Turn it on only to actually step through sim code.
+option(SIM_DEBUG_RUNTIME
+    "Publish the sim native library in Debug too (~14x slower to step; for debugging sim code)" OFF)
+if(SIM_DEBUG_RUNTIME)
+    # dotnet knows only Debug and Release, so the extra configs of a multi-config generator get Release.
+    set(SIM_DOTNET_CONFIG "$<IF:$<CONFIG:Debug>,Debug,Release>")
+    set(SIM_LIB_CONFIG_Debug   Debug)
+else()
+    set(SIM_DOTNET_CONFIG "Release")
+    set(SIM_LIB_CONFIG_Debug   Release)
+endif()
+set(SIM_LIB_CONFIG_Release Release)
 
-add_custom_target(sim_host ALL
-    COMMAND dotnet build "${SIM_HOST_PROJECT}" -c $<CONFIG> --nologo -v quiet
-    COMMENT "Building Sim.Host (C# physics sim)"
+set(SIM_CLIENT_PROJECT "${SAILBOAT_SIM_DIR}/src/Sim.Net.Client")
+
+# PublishAot is what emits the native library, so this is `publish` and not `build`. It is
+# deliberately not given -o: `publish -o <dir>` copies the .dll out but leaves the import .lib
+# behind, and MSVC needs the .lib to link. Both sit together in the intermediate native/ directory
+# that IMPORTED_IMPLIB points at below.
+# NativeAOT links through findvcvarsall.bat, which calls vcvarsall.bat with its STDOUT sent to NUL
+# but its stderr left alone. vcvarsall invokes a bare "vswhere.exe", so when the VS Installer
+# directory is not on PATH - which it is not in a plain shell, only in a Developer Command Prompt -
+# that lookup fails and prints to stderr. MSBuild captures the Exec with ConsoleToMSBuild="true",
+# splits the result on "#", and uses element [0] as the linker directory, so the error TEXT ends up
+# spliced into CppLinker and the link dies with a nonsense command. Putting vswhere on PATH removes
+# the noise at its source. The failure is invisible until something forces a fresh native link,
+# because dotnet skips the step while its output is current.
+find_program(VSWHERE_EXECUTABLE vswhere
+    HINTS "$ENV{ProgramFiles\(x86\)}/Microsoft Visual Studio/Installer"
+          "$ENV{ProgramFiles}/Microsoft Visual Studio/Installer")
+
+# The directory is handed to a .cmd wrapper rather than set here. A Windows PATH is semicolon-
+# separated and CMake treats semicolons as list separators, so a "PATH=..." argument gets torn into
+# one argument per entry; the wrapper also prepends to the live %PATH% instead of replacing it,
+# which keeps the MSVC environment MSBuild gives a custom build step.
+if(VSWHERE_EXECUTABLE)
+    get_filename_component(VSWHERE_DIR "${VSWHERE_EXECUTABLE}" DIRECTORY)
+    file(TO_NATIVE_PATH "${VSWHERE_DIR}" SIM_VSWHERE_DIR)
+    message(STATUS "Using vswhere from: ${VSWHERE_DIR}")
+else()
+    # Not fatal: a Developer Command Prompt already has both vswhere and the toolchain on PATH.
+    set(SIM_VSWHERE_DIR "")
+    message(WARNING
+        "vswhere.exe not found. If the NativeAOT link fails with a mangled linker path, build from "
+        "a Developer Command Prompt or install the Visual Studio Installer.")
+endif()
+
+add_custom_target(sim_native ALL
+    COMMAND "${CMAKE_SOURCE_DIR}/tools/publish-sim-native.cmd"
+            "${SIM_VSWHERE_DIR}" "${SIM_CLIENT_PROJECT}" ${SIM_DOTNET_CONFIG} ${SIM_NATIVE_RID}
+    COMMENT "Publishing Sim.Net.Client (NativeAOT sim client library)"
     VERBATIM
 )
-add_dependencies(${PROJECT_NAME} sim_host)
+add_dependencies(${PROJECT_NAME} sim_native)
+
+# An imported target rather than a bare path. Handed the full path to a library whose name it does
+# not recognise, target_link_libraries silently decomposes it back into -L<dir> -l<name> and the
+# linker then hunts for a file that was never going to exist - a trap the sim's integration guide
+# calls out, because the error reads as a missing library while the file sits right there.
+add_library(sim_net_client SHARED IMPORTED)
+foreach(SIM_CFG Debug Release)
+    string(TOUPPER ${SIM_CFG} SIM_CFG_UPPER)
+    # Not ${SIM_CFG}: a Debug renderer links the Release library unless SIM_DEBUG_RUNTIME is on.
+    set(SIM_NATIVE_DIR
+        "${SIM_CLIENT_PROJECT}/bin/${SIM_LIB_CONFIG_${SIM_CFG}}/net9.0/${SIM_NATIVE_RID}/native")
+    set_target_properties(sim_net_client PROPERTIES
+        IMPORTED_IMPLIB_${SIM_CFG_UPPER}   "${SIM_NATIVE_DIR}/Sim.Net.Client.lib"
+        IMPORTED_LOCATION_${SIM_CFG_UPPER} "${SIM_NATIVE_DIR}/Sim.Net.Client.dll")
+endforeach()
+set_target_properties(sim_net_client PROPERTIES
+    MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release
+    MAP_IMPORTED_CONFIG_MINSIZEREL     Release)
+
+# SimClient.h includes SimProtocol.h by name and the two headers live beside their own C# sources
+# rather than in a shared include tree, so both directories go on the include path.
+target_include_directories(${PROJECT_NAME} PRIVATE
+    "${SIM_CLIENT_PROJECT}"
+    "${SAILBOAT_SIM_DIR}/src/Sim.Net.Protocol"
+)
+target_link_libraries(${PROJECT_NAME} PRIVATE sim_net_client)
 
 # Find dxc shader compiler
 find_program(DXC_EXECUTABLE dxc
@@ -380,18 +465,11 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Copying shaders, models, scenes, and textures to output directory"
 )
 
-# Copy the managed sim assemblies + runtime config and nethost.dll next to the exe.
+# The sim's native client library next to the exe. NativeAOT output is self-contained, so this is
+# the only runtime file the sim needs.
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.dll"
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.runtimeconfig.json"
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Host.deps.json"
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Core.dll"
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Models.dll"
-        "${SIM_HOST_OUTPUT_DIR}/Sim.Telemetry.dll"
+        "$<TARGET_FILE:sim_net_client>"
         $<TARGET_FILE_DIR:${PROJECT_NAME}>
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NETHOST_DIR}/nethost.dll"
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>
-    COMMENT "Copying Sim.Host managed assemblies + nethost.dll to output directory"
+    COMMENT "Copying the sim's native client library to the output directory"
 )

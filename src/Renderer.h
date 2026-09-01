@@ -42,6 +42,10 @@ public:
     ID3D12GraphicsCommandList* GetCommandList() { return m_gfxContext.GetCommandList(); }
     GpuProfiler& GetProfiler() { return m_profiler; }
 
+    // The per-frame arena, for reading its high-water mark. Sized by hand, and what fills it grows
+    // with every dynamic mesh, so the number is worth having on screen.
+    const LinearAllocator& GetLinearAllocator() const { return m_linearAllocator; }
+
 private:
     void InitShaders();
     void InitShadow();

@@ -53,8 +53,18 @@ LinearAllocator::Allocation LinearAllocator::Allocate(UINT64 sizeBytes, UINT64 a
     // Align the current offset
     UINT64 alignedOffset = (m_currentOffset + alignment - 1) & ~(alignment - 1);
 
-    assert(alignedOffset + sizeBytes <= m_perFrameSize &&
-           "LinearAllocator: out of per-frame memory");
+    // FATAL, not assert: an assert compiles out under NDEBUG, so a Release build would sail past
+    // this and write off the end of the mapped buffer - silent corruption instead of a crash, and
+    // the crash it eventually causes would be nowhere near here.
+    if (alignedOffset + sizeBytes > m_perFrameSize)
+    {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "LinearAllocator: out of per-frame memory - needed %llu of %llu bytes",
+                 static_cast<unsigned long long>(alignedOffset + sizeBytes),
+                 static_cast<unsigned long long>(m_perFrameSize));
+        FATAL(buf);
+    }
 
     UINT64 globalOffset = static_cast<UINT64>(m_currentFrame) * m_perFrameSize + alignedOffset;
 
@@ -63,5 +73,6 @@ LinearAllocator::Allocation LinearAllocator::Allocate(UINT64 sizeBytes, UINT64 a
     alloc.gpuAddress = m_gpuBase + globalOffset;
 
     m_currentOffset = alignedOffset + sizeBytes;
+    if (m_currentOffset > m_peakOffset) m_peakOffset = m_currentOffset;
     return alloc;
 }

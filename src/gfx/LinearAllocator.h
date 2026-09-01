@@ -36,6 +36,13 @@ public:
     // Alignment defaults to 256 (D3D12 constant buffer alignment requirement).
     Allocation Allocate(UINT64 sizeBytes, UINT64 alignment = 256);
 
+    // High-water mark in bytes across every frame since Init, and the budget it is measured
+    // against. Exposed so the cost of a frame is a number you can read rather than a crash you
+    // discover: the arena is sized by hand, and what fills it (dynamic rig, debug overlays) grows
+    // as features land.
+    UINT64 PeakBytes() const { return m_peakOffset; }
+    UINT64 PerFrameBytes() const { return m_perFrameSize; }
+
 private:
     ComPtr<ID3D12Resource> m_buffer;
     uint8_t* m_mappedPtr = nullptr;
@@ -43,5 +50,6 @@ private:
     UINT64 m_perFrameSize = 0;
     UINT m_frameCount = 0;
     UINT m_currentFrame = 0;
+    UINT64 m_peakOffset = 0;
     UINT64 m_currentOffset = 0;
 };

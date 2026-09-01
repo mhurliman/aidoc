@@ -1,0 +1,2343 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Sim.Models</name>
+    </assembly>
+    <members>
+        <member name="T:Sim.Models.Appendage.FoilAddedMass">
+             <summary>
+             Shared computation of a thin foil's hydrodynamic added mass from its wetted geometry,
+             per the Plan B spec (docs/superpowers/specs/2026-05-29-added-mass-composer-design.md §3).
+             A thin foil's broadside (section-normal) added mass per unit span is the 2-D flat-plate
+             value ρ·π·(c/2)²; integrated over the wetted span (so taper is honoured) and corrected for
+             finite aspect ratio:
+            
+               A_n = ρ·π·f(AR_eff) · ∫ (chord(s)/2)² ds      over the wet sub-span
+            
+             The hull the foil mounts on acts as a rigid reflection (image) plane, so by the method of
+             images the foil behaves like the inner half of a foil of double span — the effective aspect
+             ratio is doubled: AR_eff = 2·immersedSpan/meanWetChord. f(AR) = AR/(AR+1) is a simple
+             monotonic approximation to flat-plate broadside added-mass-vs-AR data (→1 as AR→∞; for these
+             high-AR foils AR_eff≈8–14 ⇒ f≈0.9–0.95). No free constant — f is computed from the live AR, so
+             retraction lowers both span and AR and added mass falls faster than linearly.
+            
+             The result is a local diagonal on the section-normal (local-y) axis, (0, A_n, 0); the
+             <see cref="T:Sim.Core.Dynamics.AddedMassComposer"/> rotates it into body axes via the appendage's LocalToBody.
+             </summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.FoilAddedMass.Compute(System.Single,Sim.Core.Appendage.FoilGeometry,System.Single,System.Single,System.Numerics.Vector3)">
+            <summary>
+            Compute the foil's <see cref="T:Sim.Core.Dynamics.ComponentAddedMass"/> over the wet span fraction range
+            [<paramref name="wetSpanFrac0"/>, <paramref name="wetSpanFrac1"/>] of
+            <paramref name="geom"/>. <paramref name="centroid_B"/> is the body-frame centroid of the
+            wetted segment. A dry foil (empty wet range) returns <see cref="P:Sim.Core.Dynamics.ComponentAddedMass.Zero"/>.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Appendage.FoilModel">
+            <summary>
+            Shared lifting-foil core (design-doc §15 / §20 / §21) that both <see cref="T:Sim.Models.Appendage.ParametricKeelModel"/>
+            and <see cref="T:Sim.Models.Appendage.ParametricRudderModel"/> delegate to. It owns everything common to a wetted
+            lifting surface: resolving the foil's world-frame directions, computing the wet segment
+            (<see cref="M:Sim.Core.Appendage.FoilGeometry.ImmersedSegment(System.Numerics.Vector3,System.Numerics.Vector3,System.Single,Sim.Core.Environment.IWaveField,System.Single)"/> + hull-shadow <see cref="M:Sim.Core.Appendage.ImmersedSegment.ClipFromAbove(System.Single)"/>),
+            deriving the per-tick inertia (<see cref="T:Sim.Models.Util.FoilInertia"/>) and added mass (<see cref="T:Sim.Models.Appendage.FoilAddedMass"/>),
+            running the §15 <see cref="T:Sim.Models.Util.FoilSolver"/>, applying strip forces + buoyancy, and packaging the
+            <see cref="T:Sim.Core.Appendage.AppendageState"/>. Keel and rudder differ only in their <see cref="T:Sim.Models.Appendage.FoilModel.Config"/>: retraction
+            and hull-shadow ceiling (keel), and a steering stock axis + helm rotation + stock torque (rudder).
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Appendage.FoilModel.Config">
+            <summary>Per-tick configuration handed to <see cref="M:Sim.Models.Appendage.FoilModel.Evaluate(Sim.Core.Dynamics.BoatState@,Sim.Core.Environment.IWaveField,System.Single,Sim.Core.Dynamics.ForceAggregator,Sim.Models.Appendage.FoilModel.Config@,Sim.Core.Dynamics.PhysicsToggles)"/> by a thin foil model.</summary>
+            <param name="Geometry">Station-based planform (rake baked in, helm-free), in the body-aligned
+            local frame. Cached by the caller; helm is applied via <paramref name="ChordDir_L"/> and
+            <paramref name="ExtraLocalToBody"/>, not baked into the stations.</param>
+            <param name="ChordDir_L">Unit leading→trailing chord direction in the local frame, including
+            any helm rotation (rudder). For the keel this is just the raked chord direction.</param>
+            <param name="Mass_kg">Component mass; an effective density is back-solved to distribute it.</param>
+            <param name="Retraction">Fraction retracted ∈ [0,1] (0 for non-retractable foils). Shrinks the
+            wet span and slides the blade's CoM up the trunk.</param>
+            <param name="WetZoneTopZ_B">Body-frame Z ceiling: the foil above this (in-trunk / hull-wake) is
+            shielded from flow and clipped off before the solver runs.</param>
+            <param name="CopAftOfStock_m">Static chord-wise CoP offset from the span line (0 for the keel,
+            ≈¼-chord for an unbalanced transom-hung rudder).</param>
+            <param name="StockAxis_L">Optional steering-stock axis (local frame) for stock-torque
+            integration; <c>null</c> for a fixed foil. The stock line passes through the root attach point
+            offset by <paramref name="StockPointOffset_L"/>.</param>
+            <param name="StockPointOffset_L">Local-frame offset from the root attach point to a point on
+            the stock/pintle line. Lets the rotation axis sit forward of the leading edge (a real transom-
+            hung pintle) rather than on it; <c>Vector3.Zero</c> puts the stock on the root LE.</param>
+            <param name="ExtraLocalToBody">The helm rotation about the stock (rudder; identity for the keel).
+            It both swings the blade about the pintle line (see <paramref name="StockPointOffset_L"/>) and
+            composes onto the geometry's principal-axis rotation — which already carries the rake — for the
+            inertia/added-mass <c>LocalToBody</c>.</param>
+            <param name="HelmAngle_rad">The raw commanded stock angle behind <paramref name="ExtraLocalToBody"/>
+            (rudder; 0 for the keel) — carried straight through to <see cref="P:Sim.Core.Appendage.AppendageState.HelmAngle_rad"/>.</param>
+            <param name="IntegratesOwnStockRotation">Whether the caller runs its own stock-rotation
+            integrator (the rudder DOF) — carried straight through to
+            <see cref="P:Sim.Core.Appendage.AppendageState.IntegratesOwnStockRotation"/> so <c>InertiaComposer</c> folds this
+            appendage in as a point mass instead of double-counting its spin. <c>false</c> for a fixed
+            foil (keel).</param>
+        </member>
+        <member name="M:Sim.Models.Appendage.FoilModel.Config.#ctor(Sim.Core.Appendage.FoilGeometry,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Single,System.Nullable{System.Numerics.Vector3},System.Numerics.Vector3,System.Numerics.Quaternion,System.Single,System.Single,System.Single,System.Int32,System.Single,System.Single,System.String,System.Boolean)">
+            <summary>Per-tick configuration handed to <see cref="M:Sim.Models.Appendage.FoilModel.Evaluate(Sim.Core.Dynamics.BoatState@,Sim.Core.Environment.IWaveField,System.Single,Sim.Core.Dynamics.ForceAggregator,Sim.Models.Appendage.FoilModel.Config@,Sim.Core.Dynamics.PhysicsToggles)"/> by a thin foil model.</summary>
+            <param name="Geometry">Station-based planform (rake baked in, helm-free), in the body-aligned
+            local frame. Cached by the caller; helm is applied via <paramref name="ChordDir_L"/> and
+            <paramref name="ExtraLocalToBody"/>, not baked into the stations.</param>
+            <param name="ChordDir_L">Unit leading→trailing chord direction in the local frame, including
+            any helm rotation (rudder). For the keel this is just the raked chord direction.</param>
+            <param name="Mass_kg">Component mass; an effective density is back-solved to distribute it.</param>
+            <param name="Retraction">Fraction retracted ∈ [0,1] (0 for non-retractable foils). Shrinks the
+            wet span and slides the blade's CoM up the trunk.</param>
+            <param name="WetZoneTopZ_B">Body-frame Z ceiling: the foil above this (in-trunk / hull-wake) is
+            shielded from flow and clipped off before the solver runs.</param>
+            <param name="CopAftOfStock_m">Static chord-wise CoP offset from the span line (0 for the keel,
+            ≈¼-chord for an unbalanced transom-hung rudder).</param>
+            <param name="StockAxis_L">Optional steering-stock axis (local frame) for stock-torque
+            integration; <c>null</c> for a fixed foil. The stock line passes through the root attach point
+            offset by <paramref name="StockPointOffset_L"/>.</param>
+            <param name="StockPointOffset_L">Local-frame offset from the root attach point to a point on
+            the stock/pintle line. Lets the rotation axis sit forward of the leading edge (a real transom-
+            hung pintle) rather than on it; <c>Vector3.Zero</c> puts the stock on the root LE.</param>
+            <param name="ExtraLocalToBody">The helm rotation about the stock (rudder; identity for the keel).
+            It both swings the blade about the pintle line (see <paramref name="StockPointOffset_L"/>) and
+            composes onto the geometry's principal-axis rotation — which already carries the rake — for the
+            inertia/added-mass <c>LocalToBody</c>.</param>
+            <param name="HelmAngle_rad">The raw commanded stock angle behind <paramref name="ExtraLocalToBody"/>
+            (rudder; 0 for the keel) — carried straight through to <see cref="P:Sim.Core.Appendage.AppendageState.HelmAngle_rad"/>.</param>
+            <param name="IntegratesOwnStockRotation">Whether the caller runs its own stock-rotation
+            integrator (the rudder DOF) — carried straight through to
+            <see cref="P:Sim.Core.Appendage.AppendageState.IntegratesOwnStockRotation"/> so <c>InertiaComposer</c> folds this
+            appendage in as a point mass instead of double-counting its spin. <c>false</c> for a fixed
+            foil (keel).</param>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.Geometry">
+            <summary>Station-based planform (rake baked in, helm-free), in the body-aligned
+            local frame. Cached by the caller; helm is applied via <paramref name="ChordDir_L"/> and
+            <paramref name="ExtraLocalToBody"/>, not baked into the stations.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.ChordDir_L">
+            <summary>Unit leading→trailing chord direction in the local frame, including
+            any helm rotation (rudder). For the keel this is just the raked chord direction.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.Mass_kg">
+            <summary>Component mass; an effective density is back-solved to distribute it.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.Retraction">
+            <summary>Fraction retracted ∈ [0,1] (0 for non-retractable foils). Shrinks the
+            wet span and slides the blade's CoM up the trunk.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.WetZoneTopZ_B">
+            <summary>Body-frame Z ceiling: the foil above this (in-trunk / hull-wake) is
+            shielded from flow and clipped off before the solver runs.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.CopAftOfStock_m">
+            <summary>Static chord-wise CoP offset from the span line (0 for the keel,
+            ≈¼-chord for an unbalanced transom-hung rudder).</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.StockAxis_L">
+            <summary>Optional steering-stock axis (local frame) for stock-torque
+            integration; <c>null</c> for a fixed foil. The stock line passes through the root attach point
+            offset by <paramref name="StockPointOffset_L"/>.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.StockPointOffset_L">
+            <summary>Local-frame offset from the root attach point to a point on
+            the stock/pintle line. Lets the rotation axis sit forward of the leading edge (a real transom-
+            hung pintle) rather than on it; <c>Vector3.Zero</c> puts the stock on the root LE.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.ExtraLocalToBody">
+            <summary>The helm rotation about the stock (rudder; identity for the keel).
+            It both swings the blade about the pintle line (see <paramref name="StockPointOffset_L"/>) and
+            composes onto the geometry's principal-axis rotation — which already carries the rake — for the
+            inertia/added-mass <c>LocalToBody</c>.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.HelmAngle_rad">
+            <summary>The raw commanded stock angle behind <paramref name="ExtraLocalToBody"/>
+            (rudder; 0 for the keel) — carried straight through to <see cref="P:Sim.Core.Appendage.AppendageState.HelmAngle_rad"/>.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.FoilModel.Config.IntegratesOwnStockRotation">
+            <summary>Whether the caller runs its own stock-rotation
+            integrator (the rudder DOF) — carried straight through to
+            <see cref="P:Sim.Core.Appendage.AppendageState.IntegratesOwnStockRotation"/> so <c>InertiaComposer</c> folds this
+            appendage in as a point mass instead of double-counting its spin. <c>false</c> for a fixed
+            foil (keel).</summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.FoilModel.Evaluate(Sim.Core.Dynamics.BoatState@,Sim.Core.Environment.IWaveField,System.Single,Sim.Core.Dynamics.ForceAggregator,Sim.Models.Appendage.FoilModel.Config@,Sim.Core.Dynamics.PhysicsToggles)">
+            <summary>Run the foil for one tick: add forces to <paramref name="aggregator"/> and return the
+            per-tick <see cref="T:Sim.Core.Appendage.AppendageState"/>.</summary>
+        </member>
+        <member name="T:Sim.Models.Appendage.ParametricKeelModel">
+            <summary>
+            Fixed underwater foil (keel, centerboard, daggerboard) per design-doc §8.3 / §8.6, built on the
+            shared <see cref="T:Sim.Models.Appendage.FoilModel"/> core: station-based NACA <see cref="T:Sim.Core.Appendage.FoilGeometry"/>, the §15.3
+            finite-wing polar (<see cref="T:Sim.Models.Util.FoilPolar"/>) with section Cl_max / form factor derived per strip
+            from the local thickness ratio (<see cref="T:Sim.Models.Util.NacaSection"/>), the §21 buoyancy + unified parasitic
+            drag model, and §20 inertia derived from the real planform with an effective density back-solved
+            from the configured mass. Lift opposes leeway using the AR-corrected lifting-line slope computed
+            from the wet sub-planform, so a partially-retracted foil correctly loses both area and lift-curve
+            slope. Consumes <see cref="P:Sim.Core.Appendage.AppendageInputs.CenterboardRetraction"/>. Defaults match a Laser-class
+            daggerboard.
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricKeelModel.TelemetryChannels">
+            <summary>Foil readouts over this keel's own appendage slice (located by <see cref="P:Sim.Models.Appendage.ParametricKeelModel.Kind"/>).</summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.ParametricKeelModel.#ctor(Sim.Core.Environment.FluidProperties)">
+            <summary>The keel reads water density + viscosity from the shared <paramref name="environment"/>;
+            a fresh default medium is used when none is injected (isolated construction / tests).</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricKeelModel.Geometry">
+            <summary>Current foil planform geometry (component-local frame). Rebuilt lazily when a
+            geometry parameter changes; consumed by the renderer as the foil-mesh source of truth.</summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.ParametricKeelModel.BuildGeometry">
+            <summary>Build the 3-D geometry by PLACING the embedded handbook cut at the trunk. Rake and
+            shape are intrinsic to the cut's LE/TE points; the model supplies only the root-attach point.
+            The renderer and physics consume the same geometry.</summary>
+        </member>
+        <member name="T:Sim.Models.Appendage.ParametricRudderModel">
+             <summary>
+             Steerable underwater foil (transom-hung rudder) per design-doc §8.3 / §8.6, built on the shared
+             <see cref="T:Sim.Models.Appendage.FoilModel"/> core: station-based NACA <see cref="T:Sim.Core.Appendage.FoilGeometry"/>, the §15.3 finite-wing
+             polar with section Cl_max / form factor derived per strip from the local thickness ratio, the §21
+             buoyancy + unified parasitic-drag model, and §20 inertia derived from the planform with an
+             effective density back-solved from the configured mass. Consumes
+             <see cref="P:Sim.Core.Appendage.AppendageInputs.HelmAngle_rad"/> as the blade's rotation about its (raked) stock and
+             returns an <see cref="T:Sim.Core.Appendage.AppendageState"/> carrying <c>StockTorque_Nm</c> for the haptic tiller
+             servo (§18.4).
+             </summary>
+             <remarks>
+             <para>Sign convention: positive <c>HelmAngle_rad</c> rotates the trailing edge to body +y (port),
+             yawing the bow to port. Positive <c>StockTorque_Nm</c> tends to rotate the rudder further in the
+             +helm direction — the water pushing the rudder the way it's already pointing.</para>
+            
+             <para><b>Helm vs. geometry.</b> The cached <see cref="P:Sim.Models.Appendage.ParametricRudderModel.Geometry"/> is helm-free (rake only); chord
+             length is helm-invariant, so helm is applied per tick as the solver's world chord direction, the
+             inertia/added-mass <c>LocalToBody</c> rotation about the raked stock, and (in the renderer) the
+             pintle pivot. <b>Center of pressure (§15.3):</b> the chord-wise CoP starts at <c>CopAftOfStock</c>
+             at α=0 and migrates aft by <c>0.25·(1−cos α)·chord</c> as |α| grows, so helm load strengthens
+             through stall.</para>
+             </remarks>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.TelemetryChannels">
+            <summary>Foil readouts over this rudder's own appendage slice (located by <see cref="P:Sim.Models.Appendage.ParametricRudderModel.Kind"/>).</summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.ParametricRudderModel.#ctor(Sim.Core.Environment.FluidProperties)">
+            <summary>The rudder reads water density + viscosity from the shared <paramref name="environment"/>;
+            a fresh default medium is used when none is injected (isolated construction / tests).</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.Geometry">
+            <summary>Current foil planform geometry (component-local frame, helm-free / rake only).
+            Rebuilt lazily when a geometry parameter changes; consumed by the renderer as the foil-mesh
+            source of truth (the renderer applies helm via the pintle pivot — the line forward of the LE
+            carried on the cut's rotation axis).</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.InertiaAboutStock_kgm2">
+            <summary>Rotational inertia of the whole rudder assembly (blade + tiller rod) about the stock
+            axis, kg·m². Config-derived and cached; recomputed when geometry, mass, or tiller config
+            changes.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.TillerInertiaAboutStock_kgm2">
+            <summary>The tiller rod as a uniform rod pivoting at the stock, <c>(1/3)·m·L²</c>.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.StockPoint_B">
+            <summary>A point on the pintle line, body frame. The model's local frame origin coincides with
+            its body-frame placement point, so the local construction is already a body-frame position.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.StockAxis_B">
+            <summary>The DOWNWARD pintle axis — the sense a positive helm angle rotates the blade about,
+            matching the <c>qHelm</c> construction in <see cref="M:Sim.Models.Appendage.ParametricRudderModel.AddForcesAndMoments(Sim.Core.Dynamics.BoatState@,Sim.Core.Dynamics.RigidBodyProperties@,Sim.Core.Environment.IWaveField,Sim.Core.Appendage.AppendageInputs,System.Single,Sim.Core.Dynamics.ForceAggregator,Sim.Core.Dynamics.PhysicsToggles)"/>.</summary>
+        </member>
+        <member name="P:Sim.Models.Appendage.ParametricRudderModel.PintleOffset_L">
+            <summary>Pintle offset from the root LE: forward of and above it. (aft, down) → (−x, −z).</summary>
+        </member>
+        <member name="M:Sim.Models.Appendage.ParametricRudderModel.BuildGeometry">
+            <summary>Build the helm-free 3-D geometry by PLACING the embedded handbook cut at the transom.
+            Rake and shape are intrinsic to the cut's LE/TE points; the model supplies only the root-attach
+            (stock-top) point. Helm is chord-length-invariant, so it is NOT baked here — it is applied per
+            tick in <see cref="M:Sim.Models.Appendage.ParametricRudderModel.AddForcesAndMoments(Sim.Core.Dynamics.BoatState@,Sim.Core.Dynamics.RigidBodyProperties@,Sim.Core.Environment.IWaveField,Sim.Core.Appendage.AppendageInputs,System.Single,Sim.Core.Dynamics.ForceAggregator,Sim.Core.Dynamics.PhysicsToggles)"/>.</summary>
+        </member>
+        <member name="T:Sim.Models.Composition.IBoatSpec">
+            <summary>
+            The single definition of one boat class: how to compose the live sailing boat the sim runs.
+            Both the live host and tests build through this door so a class ("Laser") has exactly one
+            definition instead of a live composition root and a divergent bench/test one. A second class
+            later adds one implementation; no polymorphic registry is needed until then.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Composition.IBoatSpec.BuildLive(Sim.Core.Environment.FluidProperties,Sim.Core.Hydro.IHullModel,System.Nullable{Sim.Core.Dynamics.AddedMass})">
+            <summary>
+            The canonical live boat, always fully composed — the same models the shipped sim runs
+            (bending mast, dynamic-leech sail). <paramref name="addedMass"/> overrides the class default
+            (for decay/added-mass studies); <paramref name="hull"/> passes a persistent hull instance.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Composition.LaserBoat">
+            <summary>
+            Composition root for the live ILCA 7 boat: assembles a <see cref="T:Sim.Core.Boat.Boat"/>, always full
+            (hull + sail + keel + rudder + parametric crew), from the shared spar geometry and a sail
+            cut, using the dynamic-leech mainsail and bending mast the shipped sim runs. Both the Godot UI and
+            integration tests build the SAME boat through <see cref="M:Sim.Models.Composition.LaserBoat.Build(Sim.Core.Rig.SailCut,System.Single,System.Single,Sim.Core.Hydro.IHullModel,Sim.Core.Environment.FluidProperties)"/> instead of duplicating
+            the wiring.
+            </summary>
+            <remarks>
+            The tuning constants (boom, hull-added-mass, bootstrap aggregate, bridle) live in
+            <see cref="T:Sim.Models.Composition.LaserDefaults"/>; this only wires the components together and returns the created
+            instances so a caller can keep live references (mast for bend knobs, sail for depth read-outs,
+            per-role models for the config panel) without this method reaching into caller state.
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserBoat.LiveRig">
+            <summary>Deck-based ILCA 7 spar geometry (mast base at deck z=0). Distinct from the
+            step-based rig the component test bench composes against; the two describe the same
+            masthead/gooseneck heights above deck but clamp the bending mast differently.</summary>
+        </member>
+        <member name="T:Sim.Models.Composition.LaserBoat.Result">
+            <summary>The composed boat plus the instances a caller keeps live references to.</summary>
+        </member>
+        <member name="M:Sim.Models.Composition.LaserBoat.Result.#ctor(Sim.Core.Boat.Boat,Sim.Core.Hydro.IHullModel,Sim.Models.Rig.DynamicLeechMainsailModel,Sim.Models.Rig.BendingMast,Sim.Models.Appendage.ParametricKeelModel,Sim.Models.Appendage.ParametricRudderModel,System.Collections.Generic.IReadOnlyList{Sim.Core.Crew.ICrewModel},Sim.Core.Boat.Boom,Sim.Core.Environment.FluidProperties)">
+            <summary>The composed boat plus the instances a caller keeps live references to.</summary>
+        </member>
+        <member name="M:Sim.Models.Composition.LaserBoat.Build(Sim.Core.Rig.SailCut,System.Single,System.Single,Sim.Core.Hydro.IHullModel,Sim.Core.Environment.FluidProperties)">
+            <summary>
+            Build the live boat, always fully composed (hull + sail + keel + rudder + parametric crew).
+            <paramref name="hull"/> lets a caller pass a persistent hull instance (for the hull config
+            panel / added-mass); a fresh <see cref="T:Sim.Models.Hydro.MeshOnlyHullModel"/> is used when null.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Composition.LaserDefaults">
+            <summary>
+            The Laser tuning constants — mass, added mass, boom/traveler hardware, bridle, control-line
+            travel and crew-pull limits — that <see cref="T:Sim.Models.Composition.LaserBoat"/> composes the shipped boat from.
+            </summary>
+            <remarks>
+            This is the single source for these numbers: the live host, <see cref="T:Sim.Models.Composition.LaserSpec"/>, and the
+            tests all read them from here rather than re-declaring their own. <see cref="M:Sim.Models.Composition.LaserDefaults.Boom(System.Nullable{Sim.Core.Boat.BoomState})"/> is the one
+            factory that lives here, because the boat it belongs to is built from these same constants.
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.Properties">
+            <summary>
+            Legacy lumped boat-side aggregate. Pre-§20 callers (the bench, the first-tick
+            bootstrap in <see cref="T:Sim.Core.Runner.SimRunner"/>) still read this; once a
+            tick has run the runner replaces it with the composed per-tick aggregate from
+            <see cref="T:Sim.Core.Dynamics.InertiaComposer"/>. The numbers here are the
+            historical "boat + sailor" lump that several integration tests depend on.
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.AddedMass">
+            <summary>
+            Seed HULL-ONLY added-mass coefficients (added-mass Plan B). Foil added mass (keel, rudder)
+            is now computed per tick from wetted geometry and composed in by
+            <see cref="T:Sim.Core.Dynamics.AddedMassComposer"/>, so these hull values dropped the
+            foil-attributable share to avoid double-counting (sway 100→65, roll 50→40, yaw 60→40;
+            heave/pitch unchanged — vertical foils add ~0 there). STARTING values; the bench
+            heave/roll/pitch sliders calibrate the hull constant against measured Laser free-decay.
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.SheetStiffness_N_per_m">
+            <summary>Taut stiffness of the sheet / vang (boom force per metre of stretch past the cleat). Named
+            because a controller commanding TENSION needs the same number the boom applies force with — see
+            <see cref="M:Sim.Core.Boat.ControlLineLimits.CleatForForce(System.Single,System.Single)"/>.</summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.MainsailDesignCamber">
+            <summary>Design draft (max camber ÷ chord) the sail is cut to (~11%); seeds the skin-length
+            draft machinery. Uniform for now; a fuller-foot/flatter-head taper is deferred to C2.</summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.OuthaulMin_m">
+            <summary>Outhaul travel (distance boom-tip→clew, m): block-to-block (clew at the tip → flat foot)
+            to fully eased. Kinematic — the clew rides on the boom; tension acts along the boom.</summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.OuthaulDesign_m">
+            <summary>Outhaul that lands the foot at the C1 design draft (11%): Foot_m − Foot_m/ArcLengthRatio(0.11).</summary>
+        </member>
+        <member name="P:Sim.Models.Composition.LaserDefaults.EasedTrim">
+            <summary>The trim a boat boots and restarts on: sheet and vang at their stoppers (fully eased),
+            outhaul at design draft. Deliberately eased rather than sheeted on — a sailor trims in from here,
+            which is the pedagogical entry the free-sail and race builders both want.</summary>
+            <remarks>One value because three builders spelled it out separately and a restart now needs a
+            fourth: <see cref="T:Sim.Core.Rig.SailInputs"/> assembled from constants that already live here.</remarks>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.DaggerboardMaxRetractionFraction">
+            <summary>How far up its trunk the daggerboard may be raised, as a fraction of span (0 = fully
+            down) — the ceiling on <see cref="P:Sim.Core.Appendage.AppendageInputs.CenterboardRetraction"/>.
+            ILCA 2009 Handbook §4: only ~635 mm of the 1.0 m blade hangs below the hull keel-line — the
+            remaining ~365 mm stays inside the trunk to retain the board, so it cannot be raised past its
+            exposed depth. Span ≈ 1 m makes the fraction and a metre value numerically identical here, hence
+            the explicit <c>Fraction</c> suffix: the value alone cannot tell you which it is.</summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserDefaults.MastInertia">
+            <summary>The §20.9 Laser mast lumped inertia (mass 7 kg, CoM at the rod midpoint, I_perp =
+            m·L²/12). Now a first-class mast component (was folded into the hull model). Single source for
+            the live <c>LaserBoat</c> (BendingMast) and the test bench's rigid mast.</summary>
+        </member>
+        <member name="M:Sim.Models.Composition.LaserDefaults.Boom(System.Nullable{Sim.Core.Boat.BoomState})">
+            <summary>Fresh Boom with Laser parameters, at the given initial pose (default at rest).
+            Stateful — each composed boat owns one instance.</summary>
+        </member>
+        <member name="M:Sim.Models.Composition.LaserDefaults.Traveler">
+            <summary>Fresh traveler with the Laser bridle. Stateful — one per Boom, which is its
+            only caller.</summary>
+        </member>
+        <member name="T:Sim.Models.Composition.LaserSpec">
+            <summary>
+            The canonical ILCA 7 definition. Wraps <see cref="M:Sim.Models.Composition.LaserBoat.Build(Sim.Core.Rig.SailCut,System.Single,System.Single,Sim.Core.Hydro.IHullModel,Sim.Core.Environment.FluidProperties)"/> with the rig-tuning the
+            shipped sim actually boots (Godot <c>Main.cs</c>: EI 2e4, ζ 1.0, <see cref="P:Sim.Core.Rig.SailCut.Laser"/>),
+            so the live host, integration tests, and the AI closed-loop tests all compose the same boat.
+            The tuning constants (mass, added mass, boom, bridle) live in <see cref="T:Sim.Models.Composition.LaserDefaults"/>; this
+            is the single assembly door on top of them.
+            </summary>
+            <remarks>
+            This is the only door onto the shipped composition — the live host and every dynamic test build
+            through <see cref="M:Sim.Models.Composition.LaserSpec.BuildLive(Sim.Core.Environment.FluidProperties,Sim.Core.Hydro.IHullModel,System.Nullable{Sim.Core.Dynamics.AddedMass})"/>. The test bench composes its own rigid-mast baseline separately.
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserSpec.MastEI">
+            <summary>Mast flexural rigidity EI (N·m²) the live sim boots with (candidate-B free-leech
+            tuning). Distinct from the older, softer EI the test bench calibrates against; this is what ships.</summary>
+        </member>
+        <member name="F:Sim.Models.Composition.LaserSpec.MastDampingRatio">
+            <summary>Bending-mast damping ratio the live sim boots with (ζ=1, critically damped).</summary>
+        </member>
+        <member name="M:Sim.Models.Composition.LaserSpec.BuildLiveResult(Sim.Core.Environment.FluidProperties,Sim.Core.Hydro.IHullModel,System.Nullable{Sim.Core.Dynamics.AddedMass})">
+            <summary>The live boat plus the instances a caller keeps live references to (mast for bend
+            knobs, sail for depth read-outs). Prefer <see cref="M:Sim.Models.Composition.LaserSpec.BuildLive(Sim.Core.Environment.FluidProperties,Sim.Core.Hydro.IHullModel,System.Nullable{Sim.Core.Dynamics.AddedMass})"/> when only the boat is needed.</summary>
+        </member>
+        <member name="T:Sim.Models.Composition.StandardModels">
+            <summary>
+            The single composition root <see cref="T:Sim.Core.Configuration.ModelRegistry"/> — maps each canonical scenario
+            <c>(slot, type)</c> discriminator to a factory for the shipped model. Registers only
+            parameterless-constructible models (their geometry/placement is intrinsic or set via
+            <see cref="T:Sim.Core.Configuration.IConfigurable"/> params); the sail, boom, and mast need spar geometry and are wired
+            by <see cref="T:Sim.Models.Composition.LaserBoat"/>, not selected by name.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Composition.StandardModels.Registry">
+            <summary>A fresh registry populated with the canonical model factories.</summary>
+        </member>
+        <member name="T:Sim.Models.Crew.NullCrewModel">
+            <summary>
+            Zero-output crew model. Returns <see cref="P:Sim.Core.Crew.CrewMemberState.Empty"/> and adds nothing to
+            the aggregator. Per design-doc §17.7 / §18.8, this is the HIL handoff target — when a
+            real person is on the motion platform, their weight acts physically and the sim must
+            not synthesize crew torque (would double-count).
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Crew.NullCrewModel.CenterOfMass_B(Sim.Core.Crew.CrewInputs@)">
+            <summary>Origin, matching the <see cref="P:Sim.Core.Crew.CrewMemberState.Empty"/> this model publishes: with a real
+            person on the platform there is no synthetic crew to place, so a renderer draws none.</summary>
+        </member>
+        <member name="T:Sim.Models.Crew.ParametricCrewModel">
+            <summary>
+            Synthetic crew model — represents the helmsperson as a point mass whose CoM moves
+            along the body-y axis as a function of <see cref="P:Sim.Core.Crew.CrewInputs.HikePosition"/>. Per
+            design-doc §20.6 the crew composes like any other component: it publishes a
+            <see cref="T:Sim.Core.Dynamics.ComponentInertia"/> (mass, body-frame CoM that tracks the hike position,
+            principal inertia) which <see cref="T:Sim.Core.Dynamics.InertiaComposer"/> folds into
+            the per-tick boat aggregate, so moving the crew shifts both the aggregate CG and its
+            inertia tensor. Gravity flows from the boat-aggregate weight at the aggregate CG, so
+            this model no longer emits a gravity force into the aggregator (that would
+            double-count); the per-component gravity fields on <see cref="T:Sim.Core.Crew.CrewMemberState"/>
+            remain for diagnostics only.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Crew.ParametricCrewModel.CenterOfMass_B(Sim.Core.Crew.CrewInputs@)">
+            <summary>Crew CoM: body-y by hike position, body-x by fore/aft position, body-z fixed above the
+            deck. The Z offset <c>_crewVerticalOffset_m</c> places the crew's CoM above the deck so hiking out
+            also lifts the lever arm — drives the §20.10 inertia parallel-axis contribution.</summary>
+        </member>
+        <member name="T:Sim.Models.Dynamics.SemiImplicitEulerIntegrator">
+            <summary>
+            Semi-implicit (symplectic) Euler: advance velocities first, then use the *new* velocities
+            to advance position and orientation. Stable on conservative systems where forward Euler
+            would inject energy; first-order accurate; the standard default for real-time physics.
+            </summary>
+            <remarks>
+            Quaternion orientation update uses dq/dt = ½·Ω·q with Ω = (0, ω_x, ω_y, ω_z) and ω in
+            world frame. The result is renormalised each step so accumulated drift does not produce
+            non-unit quaternions over long runs.
+            </remarks>
+        </member>
+        <member name="T:Sim.Models.Environment.AiryWaveField">
+            <summary>
+            Single linear (Airy) deep-water wave with closed-form elevation, slope, and orbital velocity.
+            Useful for unit testing — "boat pitches over a known wave" — and as a sanity baseline before
+            turning on a Gerstner sum.
+            </summary>
+            <remarks>
+            Conventions: world frame is right-handed with Z up; mean free surface at z = 0; deep-water
+            dispersion ω² = g·k. The wave propagates in the xy-plane along direction θ.
+            </remarks>
+        </member>
+        <member name="T:Sim.Models.Environment.BoatWakeWindField">
+            <summary>
+            Per-boat <see cref="T:Sim.Core.Environment.IWindField"/> decorator that adds the fleet's boat-to-boat aero coupling (issue
+            #55): it returns the inner ambient wind plus the summed induced velocity of every FOREIGN emitter
+            (skipping <see cref="F:Sim.Models.Environment.BoatWakeWindField._ownerId"/>), then applies their combined viscous speed deficit. The inner wind
+            stack (layered → pausable → shift → puff) is the single shared instance — only this thin wrapper is
+            per-boat, so <see cref="M:Sim.Core.Environment.IWindField.Velocity(System.Numerics.Vector3,System.Single)"/>'s signature and the boat's apparent-wind derivation are
+            unchanged (the frame invariant). <see cref="T:Sim.Core.Configuration.IConfigurable"/> is delegated straight to the inner field
+            so the host's "Wind" config component is unaffected; the fleet knobs live on the shared
+            <see cref="T:Sim.Models.Environment.FleetAeroConfig"/>. Bad-air telemetry is exposed as <see cref="T:Sim.Core.Analytics.ITelemetrySource"/> channels.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Environment.BoatWakeWindField.DeficitAt(System.Numerics.Vector3,System.Single)">
+            <summary>Fractional wind-speed deficit the fleet imposes at <paramref name="worldPos"/> (0 = clean).</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.BoatWakeWindField.ShiftAt(System.Numerics.Vector3,System.Single)">
+            <summary>Signed wind-direction shift (rad) the fleet imposes at <paramref name="worldPos"/>: the
+            rotation from clean to dirty wind, positive counter-clockwise.</summary>
+            <remarks>This is a <em>shift</em>, not a header — it is tack-agnostic, so the same positive value
+            is a lift on one tack and a header on the other. A consumer that wants "am I being headed?" must
+            fold in the boat's tack itself.</remarks>
+        </member>
+        <member name="T:Sim.Models.Environment.FlatWaterField">
+            <summary>
+            Trivial wave field: η = 0 everywhere, no slope, no orbital velocity. Used as the development
+            baseline and as the control case for isolating non-wave bugs in golden tests.
+            Exposes no parameters.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Environment.FleetAeroConfig">
+            <summary>
+            Fleet-wide knobs for boat-to-boat aero coupling (issue #55). One shared instance drives every boat's
+            <c>BoatWakeWindField</c>, so a host edits it once. All parameters are read-only to the sim
+            mid-tick; a host reconfigures between ticks. <see cref="P:Sim.Models.Environment.FleetAeroConfig.Enabled"/> is a plain toggle (not a tuned
+            parameter); the numeric knobs are the <see cref="T:Sim.Core.Configuration.IConfigurable"/> surface.
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Environment.FleetAeroConfig.Enabled">
+            <summary>Master on/off for the whole coupling. Off ⇒ every wrapper is a pure passthrough.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.FleetAeroField">
+            <summary>
+            Holds the current tick's immutable emitter array and the shared <see cref="T:Sim.Models.Environment.FleetAeroConfig"/>. The
+            producer (<c>World.Step</c>) builds a fresh array and swaps the reference once, OUTSIDE the parallel
+            boat step; every boat's <see cref="T:Sim.Models.Environment.BoatWakeWindField"/> reads the frozen array during the step. The
+            reference is <c>volatile</c> so the swap publishes safely across threads — this is what keeps the
+            fleet step race-free while boats now influence each other's flow.
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Environment.FleetAeroField.Emitters">
+            <summary>The current frozen emitter array. Indexable and allocation-free to iterate.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.IrregularWaveField">
+            <summary>
+            Spectrum-driven irregular sea: a sum of N linear deep-water wave components synthesised from a
+            JONSWAP spectrum, with an optional second-order Stokes self-harmonic that sharpens crests and
+            flattens troughs. Satisfies the IWaveField height-field contract directly (single-valued, no
+            per-query inversion). See docs/superpowers/specs/2026-06-22-irregular-wave-field-design.md.
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Environment.IrregularWaveField.DefaultRmsSlopeCap">
+            <summary>The most RMS surface slope a synthesised sea may carry.
+            <para>Anchored physically rather than picked to look calm. For a narrow-band sea the RMS slope is
+            about <c>(π/2)·(Hs/Lp)</c>, so this corresponds to a significant steepness of roughly 0.13 —
+            just under the 1/7 at which real waves break, and well clear of the 0.02–0.05 a fully developed
+            wind sea runs at. So every sea a boat could actually be sailing passes, and the guard is what it
+            was designed to be: a net for input no ocean would produce.</para></summary>
+        </member>
+        <member name="P:Sim.Models.Environment.IrregularWaveField.RealizedHs">
+            <summary>Significant wave height actually realised after the steepness guard (≤ requested Hs).</summary>
+        </member>
+        <member name="P:Sim.Models.Environment.IrregularWaveField.RmsSlope">
+            <summary>Total steepness Σ(Aᵢ·kᵢ) after any clamp.</summary>
+            <summary>The RMS surface slope this sea actually carries, after any clamp.</summary>
+        </member>
+        <member name="P:Sim.Models.Environment.IrregularWaveField.ClampActive">
+            <summary>True when the steepness guard scaled amplitudes down on the last synthesis.</summary>
+        </member>
+        <member name="P:Sim.Models.Environment.IrregularWaveField.Spectrum">
+            <summary>The surface this field is currently evaluating — the components AND the sharpening
+            order — as the data a GPU mirror needs to reproduce it.</summary>
+            <remarks>Published once per synthesis, not once per read: a per-frame consumer re-reads this to
+            ask "has the sea changed since I uploaded it?", and a fresh instance each time would turn that
+            reference test into a component-by-component compare.</remarks>
+        </member>
+        <member name="M:Sim.Models.Environment.IrregularWaveField.Publish">
+            <summary>Re-publish <see cref="P:Sim.Models.Environment.IrregularWaveField.Spectrum"/> from the components just synthesised. Called by every
+            exit from <see cref="M:Sim.Models.Environment.IrregularWaveField.Rebuild"/>, so the published surface and the evaluated one cannot diverge.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Environment.IrregularWaveField.Jonswap(System.Single,System.Single,System.Single)">
+            <summary>JONSWAP spectral density (shape only; overall scale is fixed later by the Hs rescale).</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.LayeredWindField">
+             <summary>
+             Vertical wind profile: power-law speed shear and optional linear directional veer.
+             Drives sail twist — the top of the mast sees stronger and slightly different wind
+             than the boom — which is one of the main physical effects the sim must reproduce.
+             </summary>
+             <remarks>
+             Speed at altitude z (above mean surface): v(z) = v_ref · (z / z_ref)^α.
+             Direction at altitude z:                  θ(z) = θ_ref + veer · (z − z_ref).
+            
+             At z = z_ref, speed = v_ref and direction = θ_ref (matches the reference).
+             At z ≤ 0, velocity = 0 (no wind in/under the water).
+             With α = 0, the model degenerates to uniform wind = v_ref everywhere above the surface.
+             Typical α: ~0.11 over open ocean, ~0.14–0.20 over land.
+             </remarks>
+        </member>
+        <member name="T:Sim.Models.Environment.LineVortex">
+            <summary>
+            Induced velocity of one straight vortex filament (segment A→B, circulation Γ) at a field point,
+            via the Biot–Savart law with an algebraic (Scully) viscous core (R1) that removes the 1/r singularity: the
+            core term keeps the denominator finite, so the induced velocity → 0 on the filament axis instead of
+            diverging. Pure and allocation-free — safe to call from the parallel fleet step.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Environment.PausableWaveField">
+            <summary>
+            Wraps an <see cref="T:Sim.Core.Environment.IWaveField"/> and samples it at an externally-controlled
+            <see cref="P:Sim.Models.Environment.PausableWaveField.EnvironmentTime"/>, ignoring the per-call <c>t</c>. That is what lets the world freeze
+            the conditions while the sim's solver clock keeps advancing.
+            <para>
+            <c>Sim.World.SailingEnvironment</c> is the sole owner of <see cref="P:Sim.Models.Environment.PausableWaveField.EnvironmentTime"/>: it pushes
+            its phase clock in, and that clock stops while the world is paused. The setter is public only
+            because the owner lives in another assembly — nothing else should write it, or the waves stop
+            tracking the phase clock the pause is bookkept on.
+            </para>
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Environment.PausableWaveField.EnvironmentTime">
+            <summary>The time the inner field is sampled at, regardless of the <c>t</c> argument.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.PausableWindField">
+            <summary>
+            Wraps an <see cref="T:Sim.Core.Environment.IWindField"/> and samples it at an externally-controlled
+            <see cref="P:Sim.Models.Environment.PausableWindField.EnvironmentTime"/>, ignoring the per-call <c>t</c> — the wind analog of
+            <see cref="T:Sim.Models.Environment.PausableWaveField"/>. <c>Sim.World.SailingEnvironment</c> is the sole owner of
+            <see cref="P:Sim.Models.Environment.PausableWindField.EnvironmentTime"/> (public setter only because it lives in another assembly); nothing
+            else should write it.
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Environment.PausableWindField.EnvironmentTime">
+            <summary>The time the inner field is sampled at, regardless of the <c>t</c> argument.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.PuffWindField">
+             <summary>
+             Wraps an <see cref="T:Sim.Core.Environment.IWindField"/> and overlays a field of drifting <b>puffs</b> — localized, smooth
+             bumps in wind direction and speed that ride downwind across the course, so a boat reads a different
+             local wind depending on where it sits. This is the generalized (spatial) model: <see cref="M:Sim.Models.Environment.PuffWindField.Velocity(System.Numerics.Vector3,System.Single)"/>
+             varies with <em>both</em> position and time, the wind analog of the wave field.
+             </summary>
+             <remarks>
+             The puff pattern is <b>frozen turbulence</b> (Taylor's hypothesis): a static, seeded 2-D field of
+             Gaussian puffs on a jittered grid, advected as a rigid pattern at <c>DriftFraction</c> × the
+             mean wind. A point at world <c>pos</c> at time <c>t</c> samples the static pattern at
+             <c>pos − drift·t</c> — so a stationary boat still feels puffs sweep past, and a moving boat feels the
+             spatial texture as it crosses it. Every puff's centre, direction swing and speed change is a pure hash
+             of its grid cell, so the whole field is a deterministic, replayable function of <c>(pos, t, seed)</c>
+             with no carried state — safe to sample concurrently across a fleet.
+            
+             That mean comes from a <b>drift reference</b> the caller supplies, not from the wrapped field, and it
+             must be the un-perturbed base. <c>pos − drift·t</c> is the displacement only while the mean is
+             constant; advecting on an already-shifted mean makes every direction change rewrite the whole elapsed
+             history at once, teleporting the pattern by an amount that grows with <c>t</c>.
+            
+             Like <see cref="T:Sim.Models.Environment.WindShiftField"/>, it keys off the <c>t</c> handed to <see cref="M:Sim.Models.Environment.PuffWindField.Velocity(System.Numerics.Vector3,System.Single)"/>, so it
+             sits OUTSIDE a <see cref="T:Sim.Models.Environment.PausableWindField"/> and advances on the sim clock (puffs move in Free Sail /
+             Race, where the environment phase clock is frozen). Only the horizontal wind is perturbed.
+             </remarks>
+        </member>
+        <member name="F:Sim.Models.Environment.PuffWindField.CellJitter">
+            <summary>Puff centres are jittered up to ±40% of a cell off the grid, so they don't sit on a
+            visible lattice.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.PuffWindField.#ctor(Sim.Core.Environment.IWindField,Sim.Core.Environment.IWindField,System.Nullable{System.Int32},Sim.Models.Environment.WeatherClock)">
+            <param name="driftReference">The un-perturbed base wind the frozen pattern is advected on. It must
+            be config-constant during a run — that is what makes <c>mean·t</c> the exact displacement integral
+            rather than an approximation that rewrites its own history whenever the mean moves. Defaults to
+            <paramref name="inner"/>, which is correct only when nothing between them perturbs the direction.</param>
+            <inheritdoc cref="M:Sim.Models.Environment.WindShiftField.#ctor(Sim.Core.Environment.IWindField,Sim.Core.Environment.IWindField,System.Nullable{System.Int32},Sim.Models.Environment.WeatherClock)" path="/param[@name='clock']"/>
+        </member>
+        <member name="M:Sim.Models.Environment.PuffWindField.PhaseTime(System.Single)">
+            <summary>The world's clock if one is driving this field, else the caller's.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.PuffWindField.DirectionOffsetAt(System.Numerics.Vector3,System.Single)">
+            <summary>The wind-direction offset (rad) the puffs impose at <paramref name="worldPos"/> /
+            <paramref name="t"/> — the amount the local wind is bent off the ambient. Exposed for tests and for
+            a host to visualize the puff field.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.PuffWindField.SpeedFactorAt(System.Numerics.Vector3,System.Single)">
+            <summary>The speed multiplier the puffs impose at <paramref name="worldPos"/> / <paramref name="t"/>
+            (1 = ambient; &gt;1 in a lift-and-gust, &lt;1 in a lull). Floored positive so wind never reverses.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.PuffWindField.Unit(System.Int32,System.Int32,System.Int32,System.Int32)">
+            <summary>Deterministic uniform [0, 1) draw for grid cell (<paramref name="cx"/>, <paramref name="cy"/>)
+            and channel <paramref name="salt"/> — a SplitMix-style hash. Stateless and pure, so the puff layout
+            replays from the seed and the field is safe to sample from parallel boat steps.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.SailAeroEmitter">
+            <summary>
+            One sail's lumped influence on the ambient wind, rebuilt each tick and immutable thereafter: a single
+            horseshoe vortex (bound segment up the mast + two trailing filaments streaming along the apparent-wind
+            axis, R4) plus a viscous momentum-deficit plume. <see cref="M:Sim.Models.Environment.SailAeroEmitter.InducedVelocityAt(System.Numerics.Vector3,Sim.Models.Environment.FleetAeroConfig)"/> is the inviscid bend
+            (upwash ahead, downwash behind, lee-bow lift); <see cref="M:Sim.Models.Environment.SailAeroEmitter.DeficitAt(System.Numerics.Vector3,Sim.Models.Environment.FleetAeroConfig)"/> is the speed loss behind. The
+            trailing filament of length <see cref="F:Sim.Models.Environment.SailAeroEmitter.Lw_m"/> is the steady-state collapse of the shed-wake history
+            (see the spec's steady-wake assumption).
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Environment.SailAeroEmitter.MaxSailCd">
+            <summary>Ceiling on the sail's effective drag coefficient when sizing the wake deficit. A soft
+            sail broadside to the flow tops out near this; capping here keeps a low-dynamic-pressure moment
+            (luffing, head-to-wind) from inflating drag/q into a physically impossible shadow.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.Create(Sim.Core.BoatId,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Numerics.Vector3,System.Single,System.Single,Sim.Models.Environment.FleetAeroConfig)">
+            <summary>Build an emitter from raw per-sail quantities. Degenerate inputs (near-zero apparent wind
+            or span) yield an inert emitter (Γ = 0, deficit = 0).</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.FromWire(Sim.Core.BoatId,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Numerics.Vector3,System.Single,Sim.Models.Environment.FleetAeroConfig)">
+            <summary>Build an emitter from the two quantities a wire carries plus the geometry a receiver
+            already has, for a boat whose forces the receiver will never see.</summary>
+            <remarks>The reduction from a force to <paramref name="gamma"/> and <paramref name="deficit"/> has
+            happened on the sending side; this is the rest of the emitter, derived the same way
+            <see cref="M:Sim.Models.Environment.SailAeroEmitter.Create(Sim.Core.BoatId,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Numerics.Vector3,System.Single,System.Single,Sim.Models.Environment.FleetAeroConfig)"/> derives it. <see cref="M:Sim.Models.Environment.SailAeroEmitter.WakeLength(System.Single,Sim.Models.Environment.FleetAeroConfig)"/> is shared between the two rather than
+            sent, which is what keeps a receiver's plume the same length as authority's without spending
+            bytes on a number that is a pure function of the true wind.</remarks>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.Inert(Sim.Core.BoatId,System.Numerics.Vector3,System.Single,Sim.Models.Environment.FleetAeroConfig)">
+            <summary>An emitter that casts nothing — a luffing or becalmed sail, or degenerate inputs.
+            </summary>
+            <remarks>One spelling of "inert" rather than three: the convention is zero circulation and zero
+            deficit at the shortest reach, and a change to it should not have to be made in three places.
+            </remarks>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.WakeLength(System.Single,Sim.Models.Environment.FleetAeroConfig)">
+            <summary>Wake reach, TWS-coupled (R3). Shared between <see cref="M:Sim.Models.Environment.SailAeroEmitter.Create(Sim.Core.BoatId,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Numerics.Vector3,System.Single,System.Single,Sim.Models.Environment.FleetAeroConfig)"/> and
+            <see cref="M:Sim.Models.Environment.SailAeroEmitter.FromWire(Sim.Core.BoatId,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Numerics.Vector3,System.Single,Sim.Models.Environment.FleetAeroConfig)"/> so a sender and a receiver cannot compute it two ways — the receiver
+            derives this rather than being told it, so it has to derive it identically.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.SpanFromPanels(System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.SailPanelState})">
+            <summary>Lowest and highest luff corner across a sail's panels — the foot and head of the mast,
+            giving span and (via their difference) the heel-tilted bound-vortex axis.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.NetSailForce(Sim.Core.Runner.ForceDiagnostics)">
+            <summary>Net world-frame aerodynamic force summed over the sail sources in a tick's diagnostics.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.SailAeroEmitter.FromBoat(Sim.Core.BoatId,Sim.Core.Runner.SimState@,System.Single,Sim.Models.Environment.FleetAeroConfig)">
+            <summary>Build an emitter for one boat from its latest published <see cref="T:Sim.Core.Runner.SimState"/>. Reads the
+            first sail's CoE and apparent wind, the net sail force, the true wind, and the luff span.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.UniformWindField">
+            <summary>
+            Same wind velocity at every point above the water surface. Below the surface, wind is zero.
+            Useful as the development baseline and for golden tests where wind shouldn't vary spatially.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WaveComponent">
+            <summary>One linear deep-water wave component used by <see cref="T:Sim.Models.Environment.IrregularWaveField"/>.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WaveSpectrumComponent">
+            <summary>One wave component as published for a consumer that evaluates the surface itself.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WaveSpectrumComponent.#ctor(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>One wave component as published for a consumer that evaluates the surface itself.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WaveSpectrum">
+             <summary>
+             The sea state as a component list plus the order it is evaluated at — the whole surface, in a few
+             hundred bytes.
+             </summary>
+             <remarks>
+             Telemetry-shaped: read-only out, never an input. It exists so the GPU can evaluate the SAME surface
+             the CPU samples — the vertex shader sums all components per vertex while the sim direct-sums them at
+             the hull footprint and the buoys. Two evaluation strategies over one shared definition.
+            
+             <para><see cref="P:Sim.Models.Environment.WaveSpectrum.SharpeningOrder"/> is part of the definition, not a tuning detail: at 1 (the
+             default) <c>Elevation</c> adds a second-order Stokes term per component, so a consumer summing only
+             the first-order terms renders water the hull does not sit on.</para>
+            
+             <para><b>The components define the surface; they do not carry the clock it is evaluated at.</b> The
+             sim does not sample <see cref="T:Sim.Models.Environment.IrregularWaveField"/> directly — it goes through
+             <see cref="T:Sim.Models.Environment.PausableWaveField"/>, which ignores the caller's <c>t</c> and uses
+             <c>Sim.World.SailingEnvironment.PhaseTime</c>. That clock is held back by a pause while the sim clock
+             keeps running, so a consumer summing these components at the wrong one renders water the hull is not
+             sitting on just as surely as dropping the Stokes term does. Which is why a snapshot puts
+             <c>WorldSnapshot.PhaseTime</c> on the wire beside <c>ServerTime</c> — the two are different clocks
+             with different jobs.</para>
+             </remarks>
+        </member>
+        <member name="M:Sim.Models.Environment.WaveSpectrum.#ctor(System.Collections.Generic.IReadOnlyList{Sim.Models.Environment.WaveSpectrumComponent},System.Int32)">
+             <summary>
+             The sea state as a component list plus the order it is evaluated at — the whole surface, in a few
+             hundred bytes.
+             </summary>
+             <remarks>
+             Telemetry-shaped: read-only out, never an input. It exists so the GPU can evaluate the SAME surface
+             the CPU samples — the vertex shader sums all components per vertex while the sim direct-sums them at
+             the hull footprint and the buoys. Two evaluation strategies over one shared definition.
+            
+             <para><see cref="P:Sim.Models.Environment.WaveSpectrum.SharpeningOrder"/> is part of the definition, not a tuning detail: at 1 (the
+             default) <c>Elevation</c> adds a second-order Stokes term per component, so a consumer summing only
+             the first-order terms renders water the hull does not sit on.</para>
+            
+             <para><b>The components define the surface; they do not carry the clock it is evaluated at.</b> The
+             sim does not sample <see cref="T:Sim.Models.Environment.IrregularWaveField"/> directly — it goes through
+             <see cref="T:Sim.Models.Environment.PausableWaveField"/>, which ignores the caller's <c>t</c> and uses
+             <c>Sim.World.SailingEnvironment.PhaseTime</c>. That clock is held back by a pause while the sim clock
+             keeps running, so a consumer summing these components at the wrong one renders water the hull is not
+             sitting on just as surely as dropping the Stokes term does. Which is why a snapshot puts
+             <c>WorldSnapshot.PhaseTime</c> on the wire beside <c>ServerTime</c> — the two are different clocks
+             with different jobs.</para>
+             </remarks>
+        </member>
+        <member name="T:Sim.Models.Environment.WaveSpectrumTexture">
+            <summary>
+            The memory layout a <see cref="T:Sim.Models.Environment.WaveSpectrum"/> takes when it is handed to a vertex shader: an
+            RGBA-float image, one column per component and two rows, so a shader reads a component with two
+            <c>texelFetch</c>es and raising the component count needs no shader change.
+            </summary>
+            <remarks>
+            <para>Row 0 is <c>(amplitude, wavenumber, omega, phase)</c>; row 1 is <c>(dirX, dirY, 0, 0)</c> —
+            six floats over eight channels, because a component does not divide evenly into RGBA and a third
+            row costs more than two wasted channels.</para>
+            <para><b>This layout is stated twice</b> — here and in <c>water.gdshader</c>'s wave loop — because
+            nothing can share a declaration across C# and GLSL. This side is the one with tests; a change here
+            is a change there.</para>
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Environment.WaveSpectrumTexture.RowCount">
+            <summary>Rows in the image: one for the scalar terms, one for the direction unit vector.</summary>
+        </member>
+        <member name="F:Sim.Models.Environment.WaveSpectrumTexture.ChannelsPerTexel">
+            <summary>Channels per texel — the image is RGBA.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WaveSpectrumTexture.TexelWidth(Sim.Models.Environment.WaveSpectrum)">
+            <summary>Image width in texels. Never zero: a calm sea has no components, and a texture cannot
+            be zero-wide, so it packs one texel of zeros that the shader's component count stops it reading.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WaveSpectrumTexture.FloatCount(Sim.Models.Environment.WaveSpectrum)">
+            <summary>Floats a <see cref="M:Sim.Models.Environment.WaveSpectrumTexture.Pack(Sim.Models.Environment.WaveSpectrum,System.Span{System.Single})"/> destination must hold for this spectrum.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WaveSpectrumTexture.Pack(Sim.Models.Environment.WaveSpectrum,System.Span{System.Single})">
+            <summary>Write <paramref name="spectrum"/> into <paramref name="texels"/> in row-major RGBA
+            order. Unused channels are zeroed, so the destination need not arrive clean.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WeatherClock">
+            <summary>
+            The clock the moving weather runs on — one instance per world, written once a tick by whoever owns
+            the fleet, read by every boat sampling the wind.
+            </summary>
+            <remarks>
+            <para><b>Why weather cannot key off the observer's clock.</b> A wind shift or a puff is a property of
+            the world, not of the boat looking at it: two boats a hull apart must read the same front at the same
+            instant, or they are sailing different weather in one race. But <c>IWindField.Velocity</c> is handed
+            the <em>caller's</em> time, and a caller is a <c>SimSession</c> whose clock is its own step counter.
+            Those counters agree only by convention — every session seeded to the world clock, every boat stepped
+            the same number of times — and a convention is something each new call site has to remember. One that
+            forgets does not fail; it sails a different phase of the shift, which looks like weather.</para>
+            <para>So the layers read this instead. It is the same move <see cref="T:Sim.Models.Environment.PausableWindField"/> already
+            makes for the base sea and breeze, which samples its inner field at its own
+            <see cref="P:Sim.Models.Environment.PausableWindField.EnvironmentTime"/> regardless of the <c>t</c> it is handed — the
+            difference being that this clock keeps running while that one is frozen, because a pause stops the
+            swell, not the front crossing the course.</para>
+            <para>A field built without one falls back to the <c>t</c> it is handed. That is the honest answer for
+            a caller with no world — a bench, a solver, the fields' own tests — where the observer's clock is the
+            only clock there is.</para>
+            </remarks>
+        </member>
+        <member name="P:Sim.Models.Environment.WeatherClock.Now">
+            <summary>Sim seconds. Set from the world clock at the tick boundary, before any boat samples.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WindShiftField">
+             <summary>
+             Wraps an <see cref="T:Sim.Core.Environment.IWindField"/> and overlays a superposition of travelling <b>fronts</b> — plane
+             waves in the wind's direction and speed that sweep down the course, the oscillating shift upwind
+             tactics live on. Unlike a time-only oscillation, a front reaches one side of the course before the
+             other, and a boat's encounter rate depends on its heading: beating into the fronts meets them far
+             more often than running away from them.
+             </summary>
+             <remarks>
+             The pattern is <b>frozen turbulence</b> (Taylor's hypothesis), the same principle as
+             <see cref="T:Sim.Models.Environment.PuffWindField"/>: a static field of plane waves translated at the base mean wind, so a
+             point at world <c>pos</c> at time <c>t</c> samples the static pattern at <c>pos − U·t</c>. Because
+             <c>U</c> is the <em>un-perturbed</em> base — config-constant during a run — <c>U·t</c> is the exact
+             displacement integral rather than an approximation that rewrites its own history whenever the mean
+             moves.
+            
+             Each component's front tilt is fixed. A time-varying tilt would make the written phase
+             <c>k(t)·x − ωt</c> diverge from the true <c>∫(dφ/dt)dt</c>, so the pattern would swing and teleport
+             with error growing as <c>|x|·Δk</c>. Variety comes from the superposition instead: four internally
+             rigid fronts at four tilts sum to a pattern whose apparent line orientation wanders as different
+             components dominate.
+            
+             Frequency is derived, not configured: expanding <c>kᵢ·(x − U·t)</c> gives <c>ωᵢ = kᵢ·U</c>, so a
+             tilted front sweeps a fixed point more slowly and a moving boat sets its own encounter rate.
+            
+             Like <see cref="T:Sim.Models.Environment.PuffWindField"/> it keys off the <c>t</c> handed to <see cref="M:Sim.Models.Environment.WindShiftField.Velocity(System.Numerics.Vector3,System.Single)"/>, so it
+             sits OUTSIDE a <see cref="T:Sim.Models.Environment.PausableWindField"/> and advances on the sim clock (fronts move in Free
+             Sail / Race, where the environment phase clock is frozen).
+             </remarks>
+        </member>
+        <member name="F:Sim.Models.Environment.WindShiftField.MinWavelengthSpeed_mps">
+            <summary>Floor on the wind speed used to size wavelengths (not on the advection itself). Wavelength
+            scales with wind speed, so without this a near-calm setting shrinks fronts below the size of the
+            rig.</summary>
+        </member>
+        <member name="T:Sim.Models.Environment.WindShiftField.FrontComponent">
+            <summary>One plane-wave front, in wind-relative terms so the table survives a live change to the
+            base wind's speed or direction. <see cref="P:Sim.Models.Environment.WindShiftField.FrontComponent.WavelengthFactor"/> multiplies <c>|U|·ShiftPeriod</c>
+            and <see cref="P:Sim.Models.Environment.WindShiftField.FrontComponent.Tilt_rad"/> rotates off the mean wind, both resolved at sample time.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.FrontComponent.#ctor(System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>One plane-wave front, in wind-relative terms so the table survives a live change to the
+            base wind's speed or direction. <see cref="P:Sim.Models.Environment.WindShiftField.FrontComponent.WavelengthFactor"/> multiplies <c>|U|·ShiftPeriod</c>
+            and <see cref="P:Sim.Models.Environment.WindShiftField.FrontComponent.Tilt_rad"/> rotates off the mean wind, both resolved at sample time.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.#ctor(Sim.Core.Environment.IWindField,Sim.Core.Environment.IWindField,System.Nullable{System.Int32},Sim.Models.Environment.WeatherClock)">
+            <param name="driftReference">The un-perturbed base wind the frozen pattern is advected on. It must
+            be config-constant during a run — that is what makes <c>U·t</c> the exact displacement integral.
+            Defaults to <paramref name="inner"/>, correct only when nothing between them perturbs the wind.</param>
+            <param name="clock">The world's weather clock. When given, it — not the <c>t</c> handed to
+            <see cref="M:Sim.Models.Environment.WindShiftField.Velocity(System.Numerics.Vector3,System.Single)"/> — decides the phase, so every boat in a fleet reads one front however their
+            own session clocks stand. Null falls back to <c>t</c>; see <see cref="T:Sim.Models.Environment.WeatherClock"/>.</param>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.PhaseTime(System.Single)">
+            <summary>The world's clock if one is driving this field, else the caller's.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.OffsetAt(System.Numerics.Vector3,System.Single)">
+            <summary>The directional offset (rad) the fronts impose at <paramref name="worldPos"/> /
+            <paramref name="t"/> — the amount the wind is bent off the mean. Takes a position because a front
+            reaches one part of the course before another.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.SpeedFactorAt(System.Numerics.Vector3,System.Single)">
+            <summary>The speed multiplier the fronts impose (1 = mean; &gt;1 in a gust, &lt;1 in a lull).</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.Components">
+            <summary>The front table. Built eagerly in the constructor and replaced whole on reconfiguration —
+            never built on the sampling path. A fleet samples this field from parallel boat steps
+            (<c>World.Step</c> fans out over boats), and lazily publishing a freshly-built array to those
+            threads without a barrier is not safe on a weak memory model: a reader could see the reference
+            before the element writes. <see cref="T:System.Threading.Volatile"/> pairs the release on write with the acquire here,
+            so a reader sees either the old table or a fully-written new one.</summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.BuildComponents">
+            <summary>Draw the front table from the seed. Weights fall as 1, 1/3, 1/5, 1/7, normalised to sum
+            to 1 — so both signals stay bounded to [-1, 1] and ShiftRange / SpeedRange remain true peak bounds.
+            <para>The odd ladder is load-bearing, not cosmetic. It puts 0.60 on the leading front against 0.40
+            shared by the rest, so the followers cannot cancel the leader even when all three oppose it
+            (floor 0.19). An even 1, 1/2, 1/3, 1/4 ladder gives the leader only 0.48 against 0.52, which does
+            fully cancel: measured on seed 12345 it flattened the breeze to under 2° for roughly two minutes
+            while the apparent front orientation thrashed.</para></summary>
+        </member>
+        <member name="M:Sim.Models.Environment.WindShiftField.UnitSample(System.Int32,System.Int32,System.Int32)">
+            <summary>Deterministic uniform [0, 1) draw for component <paramref name="index"/> and channel
+            <paramref name="salt"/> — a SplitMix64 hash. Stateless and pure, so the layout replays from the
+            seed and the field is safe to sample from parallel boat steps.</summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.BuoyMesh">
+            <summary>
+            The shape of a buoy: a profile revolved about its vertical axis — rounded bottom, bulge near the
+            waterline, tapering to an apex. One definition, read by the renderer that draws it and by the
+            collision shape that is hit, so the two cannot disagree.
+            </summary>
+            <remarks>
+            It lives here rather than beside the mesh builder in the Godot host because the sim libraries are
+            engine-free and collision cannot reach across that line — the same reason
+            <see cref="T:Sim.Models.Hydro.RoundBilgeLaserHullMesh"/> is here and the renderer consumes it. A copy on each side was
+            the alternative, and copied geometry drifts silently.
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Hydro.BuoyMesh.Profile">
+            <summary>Normalised <c>(radius, height)</c> stations, as fractions of the buoy's radius and
+            height. Radius rises to 1 just above the waterline and falls to nothing at the apex; height runs
+            slightly negative so the rounded bottom sits below the origin.</summary>
+        </member>
+        <member name="F:Sim.Models.Hydro.BuoyMesh.DefaultSegments">
+            <summary>How many angular divisions the revolution uses. The renderer closes the ring with a
+            duplicate seam vertex for texturing; collision does not, because a repeated point cannot change
+            a support query.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.BuoyMesh.Revolve(System.Single,System.Single,System.Int32)">
+            <summary>The revolved surface's vertices, in body frame. Ring-major: all
+            <paramref name="segments"/> of station 0, then station 1, and so on.</summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.FloatingBody">
+            <summary>
+            A floating object as a 6-DOF rigid body, moored at an anchor. Buoyancy is a vertical stack of disc
+            slices following the body's profile (rounded bottom → fat middle → taper): each slice contributes
+            ρg·volume·(submerged fraction), so the rounded bottom is always wet (no trough free-fall) and
+            pushing the body down hits the wide middle (progressive restoring — it rides on top, doesn't
+            dunk). Each <see cref="M:Sim.Models.Hydro.FloatingBody.Step(Sim.Core.Environment.IWaveField,System.Single,System.Single,Sim.Core.Collision.Response.ContactLoad@)"/> also adds relative-velocity damping per submerged slice, gravity
+            at a low CG and a soft mooring spring, folds in directional added mass, and advances with the
+            sim's <see cref="T:Sim.Models.Dynamics.SemiImplicitEulerIntegrator"/>. Pure / deterministic. See
+            docs/superpowers/specs/2026-06-25-floating-buoys-design.md.
+            </summary>
+            <remarks>
+            Named for what it models, not for the one thing that used it first: a race mark, a drifting log and
+            a committee boat differ only in their <see cref="T:Sim.Models.Hydro.FloatingBodySpec"/>. Zero mooring stiffness leaves
+            it unmoored, riding the wave orbital velocity through the damping term rather than held to a point.
+            </remarks>
+        </member>
+        <member name="M:Sim.Models.Hydro.FloatingBody.Settle(System.Single,System.Single)">
+            <summary>Settle to the equilibrium draft in flat water so the buoy doesn't spawn-bounce.
+            8 s is long enough for the lightly-damped heave transient to decay to rest.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.FloatingBody.Step(Sim.Core.Environment.IWaveField,System.Single,System.Single,Sim.Core.Collision.Response.ContactLoad@)">
+            <summary>Advance one tick, carrying any contact resolved for this body. The load is a force and a
+            moment about the body's own origin, which is the frame this method already accumulates in — so
+            contact composes with buoyancy, damping and the mooring rather than being applied apart from
+            them.</summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.FloatingBodySpec">
+            <summary>
+            Tunable geometry + physics parameters for a <see cref="T:Sim.Models.Hydro.FloatingBody"/>. The buoyancy is a vertical
+            stack of disc slices following the profile (rounded bottom → fat middle → taper), so the rounded
+            bottom is always wet and pushing the body down hits the wide middle (strong, progressive
+            restoring — it rides on top instead of dunking). All single fields, retune live. See
+            docs/superpowers/specs/2026-06-25-floating-buoys-design.md §5–6.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.FloatingBodySpec.#ctor(System.Single,System.Single,System.Single,System.Single,System.Single,System.Int32,System.Int32,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>
+            Tunable geometry + physics parameters for a <see cref="T:Sim.Models.Hydro.FloatingBody"/>. The buoyancy is a vertical
+            stack of disc slices following the profile (rounded bottom → fat middle → taper), so the rounded
+            bottom is always wet and pushing the body down hits the wide middle (strong, progressive
+            restoring — it rides on top instead of dunking). All single fields, retune live. See
+            docs/superpowers/specs/2026-06-25-floating-buoys-design.md §5–6.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.FloatingBodySpec.DefaultMark">
+            <summary>A small inflatable race mark: rides high on its rounded bottom, large reserve so it
+            stays on top in big waves, gentle roll and sway. Numbers tuned for the look; adjust live.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.FloatingBodySpec.Drifter">
+            <summary>An unmoored floating object — a log, a lost fender, something the tide left. Same
+            hydrostatics as a mark with the anchor spring removed, so it rides the wave orbital velocity
+            instead of being held to a point. It does not advect: there is no current field to advect on.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.MeshOnlyHullModel">
+            <summary>
+            Mesh-hydrostatic hull model per design-doc §8.2. Per tick: classify each triangle of
+            a closed hull mesh as fully submerged, fully dry, or partially submerged; integrate
+            hydrostatic pressure (ρ·g·depth) over each wetted face; add the resulting force at
+            the face centroid to the force aggregator. The aggregator handles converting off-CG
+            forces into translation + righting moment automatically.
+            </summary>
+            <remarks>
+            Per §21, the lumped <c>LinearDrag</c> placeholder is replaced with the unified
+            <c>Cf(Re)·(1+k_hull)</c> parasitic-drag model: skin friction times form factor times
+            dynamic pressure times total wetted area. Reynolds number uses the boat's velocity
+            magnitude and the configurable waterline length. AngularDrag stays as a simple
+            transverse-rotational damping placeholder. Both parametric Cw(Fr) wave-making drag and
+            the per-face v_n² pressure/planing term are implemented in this class (see below).
+            </remarks>
+        </member>
+        <member name="P:Sim.Models.Hydro.MeshOnlyHullModel.TelemetryChannels">
+            <summary>Hydrostatic/drag readouts over this hull's published <see cref="T:Sim.Core.Hydro.HullState"/>.</summary>
+        </member>
+        <member name="P:Sim.Models.Hydro.MeshOnlyHullModel.Mesh">
+            <summary>The hull mesh consumed by both physics and renderer.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.MeshOnlyHullModel.#ctor(Sim.Core.Environment.FluidProperties)">
+            <summary>Default constructor uses the hand-authored round-bilge Laser hull mesh
+            (<see cref="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.Build"/>). Avoids the curve-interpolation artifacts of
+            the procedural generator while staying as a drop-in replacement.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.MeshOnlyHullModel.#ctor(Sim.Core.Hydro.HullMesh,Sim.Core.Environment.FluidProperties)">
+            <summary>Construct from any pre-built hull mesh (loaded from disk, generated, or
+            hand-authored). Useful for tests and for swapping in alternative hull shapes.</summary>
+        </member>
+        <member name="P:Sim.Models.Hydro.MeshOnlyHullModel.ContactMaterial">
+            <inheritdoc />
+        </member>
+        <member name="M:Sim.Models.Hydro.MeshOnlyHullModel.BuildHullInertialComponents">
+            <summary>Build the §20 hull + mast inertial components. Used both from the
+            per-tick state-population code below and by tests asserting closed-form aggregate
+            CG without driving the whole evaluation pipeline.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.MeshOnlyHullModel.ClipAndAccumulate(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Numerics.Vector3,System.Numerics.Vector3,Sim.Core.Dynamics.BoatState@,Sim.Core.Dynamics.ForceAggregator,System.Single@,System.Single@,System.Single@,System.Numerics.Vector3@,System.Boolean)">
+            <summary>
+            Clip a triangle against the local water plane defined linearly by the three
+            per-vertex submersion values δ_i. Emit the submerged sub-polygon (one or two
+            triangles depending on how many vertices are wet) and accumulate hydrostatic
+            pressure into <paramref name="aggregator"/>. Winding is preserved from the parent
+            triangle so the outward normal direction is unchanged.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.MeshOnlyHullModel.ApplyNormalPressureDrag(System.Numerics.Vector3,System.Single,System.Numerics.Vector3,Sim.Core.Dynamics.BoatState@,Sim.Core.Dynamics.ForceAggregator,System.Single@,System.Boolean)">
+            <summary>
+            §15.2 per-face quadratic pressure drag along the face normal. For each wetted face,
+            compute the face-centroid velocity from rigid-body kinematics
+            (<c>v_p = v_cg + ω × (p − p_cg)</c>), project onto the outward normal, and apply
+            <c>F = −½·ρ·Cd·A·|v_n|·v_n · n̂</c>. The sign convention:
+            <list type="bullet">
+              <item><c>v_n &lt; 0</c> (face moving INTO the water) → force along <c>+n̂</c> (water pushes back).</item>
+              <item><c>v_n &gt; 0</c> (face moving OUT of the water) → force along <c>−n̂</c>
+                    (symmetric "suction"; physically capped by cavitation but kept symmetric here
+                    for stable damping in both directions).</item>
+            </list>
+            Because the force is applied at the face centroid rather than the CG, lever-arm
+            moments naturally damp rotation as well — this largely subsumes the
+            <c>AngularDrag</c> placeholder once tuned.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.RoundBilgeLaserHullMesh">
+             <summary>
+             Round-bilge ILCA/Laser hull consumed by <see cref="T:Sim.Models.Hydro.MeshOnlyHullModel"/>. Each station's
+             cross-section is a smooth cubic Bézier sweep from the keel centreline through
+             the turn of the bilge to the gunwale — no hard chine.
+            
+             Offsets are TRACED from references (see spec 2026-06-07-round-bilge-hull-design §13):
+               SheerY  — ILCA 2009 Handbook p44 deck plan (half-beam vs length).
+               SheerZ, KeelZ — ILCA side render (gunwale + keel/rocker).
+             Frame: +x fwd, +y port, +z up; x = L/2 − xFrac·L; L = 4.23 m.
+             </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.BuildVisual">
+            <summary>
+            RENDER-ONLY hull mesh: the same bilge sections as <see cref="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.Build"/>, but the flat gunnel-to-
+            gunnel deck cap is replaced by a dished deck with a recessed cockpit/footwell. Built as one
+            closed ring per station (arc + deck cross-section), so the whole shell — sides, bottom and
+            dished deck — tiles watertight and you can see down into the footwell. NOT consumed by the
+            physics (<see cref="T:Sim.Models.Hydro.MeshOnlyHullModel"/> uses <see cref="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.Build"/>), so flotation is unchanged.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.DeckColumnYs(Sim.Models.Hydro.RoundBilgeLaserHullMesh.Station)">
+            <summary>Lateral y positions of the interior deck columns (−y gunwale → +y gunwale, gunwales
+            excluded). The cockpit rim (±rim) and floor (±floorY) corners are placed on exact columns.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.DeckZ(System.Single,Sim.Models.Hydro.RoundBilgeLaserHullMesh.Station,System.Single)">
+            <summary>Deck z at lateral position <paramref name="y"/>: sheer + crown on the side deck,
+            dishing linearly down the cockpit wall to the footwell floor where the cockpit is active.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.CockpitActivation(System.Single)">
+            <summary>Longitudinal cockpit presence: 0 outside the footwell, ramping to 1 over
+            <see cref="F:Sim.Models.Hydro.RoundBilgeLaserHullMesh.CockpitEndRamp"/> at each end (the sloped forward/aft cockpit faces).</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.SectionHalf(Sim.Models.Hydro.RoundBilgeLaserHullMesh.Station)">
+            <summary>Cubic-Bézier half-section, keel (t=0) -> gunwale (t=1), PointsPerSide+1 pts.</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.RoundBilgeLaserHullMesh.SubmergedVolumeAtRest(Sim.Core.Hydro.HullMesh)">
+            <summary>Total enclosed volume by signed-tetrahedron integration (== submerged
+            volume below z=0 when the deck is at z≈0).</summary>
+        </member>
+        <member name="T:Sim.Models.Hydro.WakeFoam">
+            <summary>
+            Reproduces <see cref="T:Sim.Models.Hydro.MeshOnlyHullModel"/>'s wave-making drag magnitude from forward speed alone
+            (issue #319). The wire deliberately carries no forces, so a renderer holding only a snapshot has no
+            <c>HullState.WaveDragMagnitude_N</c> to drive wake foam from — but the number is a closed form in
+            forward speed (<c>WaveMakingDrag</c>, the same static math the hull calls) given a handful of
+            per-hull-class constants and the water density, both of which a client already has: the constants
+            ride by class id (<c>BoatClassRegistry</c> in <c>Sim.Net.Client</c>) the same way the rig and
+            sail cut do, and forward speed is <c>dot(velocity_W, forward_W)</c> off the snapshot. A client that
+            reproduces this exactly needs zero wire bytes for it — it is one function, not two curves that agree.
+            </summary>
+            <remarks>
+            Returns <b>newtons</b>, not a normalised [0,1] drive: <c>WakeConfig.FoamDragRef_N</c> is a live
+            <c>set</c> property edited on the Wake config panel, so normalising here would bake one host's
+            dial into every client's copy of the curve. <c>WakeSystem</c> keeps doing the
+            <c>Clamp(magnitude / FoamDragRef_N, 0, 1)</c> mapping itself.
+            </remarks>
+        </member>
+        <member name="T:Sim.Models.Hydro.WakeFoam.Constants">
+            <summary>
+            The wave-drag dials for one hull class, grouped because none of them means anything alone and
+            they all change together when a hull is retuned — the same reasoning as <c>LeechCarry</c> et al.
+            (CLAUDE.md, "group related loose state"). Water density is deliberately NOT a member: it is an
+            environment property (the shared <c>FluidProperties</c>), not a hull constant, so it is a
+            separate argument to <see cref="M:Sim.Models.Hydro.WakeFoam.WaveDrag(System.Single,Sim.Models.Hydro.WakeFoam.Constants@,System.Single)"/>.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.WakeFoam.Constants.#ctor(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>
+            The wave-drag dials for one hull class, grouped because none of them means anything alone and
+            they all change together when a hull is retuned — the same reasoning as <c>LeechCarry</c> et al.
+            (CLAUDE.md, "group related loose state"). Water density is deliberately NOT a member: it is an
+            environment property (the shared <c>FluidProperties</c>), not a hull constant, so it is a
+            separate argument to <see cref="M:Sim.Models.Hydro.WakeFoam.WaveDrag(System.Single,Sim.Models.Hydro.WakeFoam.Constants@,System.Single)"/>.
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Hydro.WakeFoam.Constants.Laser">
+            <summary>The Laser/ILCA dials, sourced from <see cref="T:Sim.Models.Hydro.MeshOnlyHullModel"/>'s own published
+            <c>Default*</c> constants rather than restated here — a second copy is exactly the drift
+            this helper exists to avoid. Lives on the value type, not on <see cref="T:Sim.Models.Hydro.WakeFoam"/> itself,
+            matching how a known instance of a class-standard document is found elsewhere in this
+            codebase (<c>SailCut.Laser</c>, <c>FoilCut.LaserDaggerboard</c>).</summary>
+        </member>
+        <member name="M:Sim.Models.Hydro.WakeFoam.Froude(System.Single,Sim.Models.Hydro.WakeFoam.Constants@)">
+            <summary>The longitudinal Froude number this hull class is running at, at this forward speed.
+            </summary>
+            <remarks>Published beside <see cref="M:Sim.Models.Hydro.WakeFoam.WaveDrag(System.Single,Sim.Models.Hydro.WakeFoam.Constants@,System.Single)"/> rather than left to the caller because it is the
+            SAME derivation — the drag below is a curve in this number — and because a caller that reached for
+            <see cref="M:Sim.Models.Util.WaveMakingDrag.Froude(System.Single,System.Single)"/> itself would have to know which of the six
+            <see cref="T:Sim.Models.Hydro.WakeFoam.Constants"/> is the waterline length. One owner of that lookup is the whole point of
+            this type.</remarks>
+        </member>
+        <member name="M:Sim.Models.Hydro.WakeFoam.WaveDrag(System.Single,Sim.Models.Hydro.WakeFoam.Constants@,System.Single)">
+            <summary>Wave-making drag magnitude, newtons, at this forward speed.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.BendingMast">
+             <summary>
+             Dynamic mast bend: a damped modal oscillator per bending plane. The Euler–Bernoulli cantilever
+             (clamped at the deck, free at the masthead, length L = deck→masthead) gives the quasi-static TARGET
+             masthead deflection under the published loads; the served deflection then follows that target through
+             a damped oscillator — mass = <see cref="P:Sim.Models.Rig.BendingMast.ModalMass_kg"/>, stiffness = the tip stiffness k = 3EI/L³,
+             damping ratio = <see cref="P:Sim.Models.Rig.BendingMast.DampingRatio"/> — integrated quasi-implicitly (stiffness AND damping
+             implicit; closed-form, no iteration, unconditionally stable). This gives the mast real inertia +
+             damping so it can't track the ~22 Hz boom–leech buzz that destabilised the old instantaneous
+             quasi-static mast. One modal DOF (first bending mode); the served shape is q·φ(h).
+             The quasi-static target is additionally amplified by the axial moment-magnifier 1/(1 − P/P_cr)
+             (P-δ): the masthead/leech down-pull compresses the mast and magnifies the transverse bend.
+             The x/y bending planes are linear and decoupled (isotropic EI).
+            
+             The cantilever is clamped at the deck; the gooseneck rides on the bend at height h_g above the deck.
+             Callers pass heights ABOVE THE GOOSENECK; the mast adds h_g internally before evaluating the
+             cantilever shape/influence.
+            
+             See spec 2026-06-06-mast-inertia-damping-design.
+             </summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.EI">
+            <summary>Flexural rigidity (N·m²). Sets the tip stiffness k = 3EI/L³ and (with the mass) the
+            natural frequency ω = √(k/m): larger = stiffer = less bend + higher ω. Tuned live.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.ModalMass_kg">
+            <summary>First-mode modal mass (kg) — the inertia that keeps the masthead from tracking fast
+            (boom–leech) oscillations. ~0.5–0.7 kg for a Laser (modal mass of a ~2–3 kg distributed mast).</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.DampingRatio">
+            <summary>Damping ratio ζ. ≥1 over-damped (monotone approach, no overshoot); &lt;1 rings. Default
+            1.0 (critically damped) — robustly stable in the coupled rig; a partial-damping band (ζ≈0.4–0.8)
+            can resonate with the boom–leech mode at some masses, so the safe default is critical.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.Locked">
+            <summary>When true, <see cref="M:Sim.Models.Rig.BendingMast.Integrate(System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.MastLoad},System.Single)"/> is a no-op and the masthead deflection is held —
+            a rigid-but-bent mast (set via <see cref="M:Sim.Models.Rig.BendingMast.SetMastheadDeflection(System.Single,System.Single)"/>). Used by the live-sim mast
+            lock to study sail shape at a fixed bend, free of the dynamic feedback.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.MaxAxialLoadFraction">
+            <summary>P-δ axial clamp: the fraction of the Euler buckling load P_cr = π²EI/(4L²) at which the
+            moment-magnifier 1/(1 − P/P_cr) is capped (default 0.3 ⇒ magnifier ≤ 1.43×), so an extreme down-pull
+            can't drive the bend into the buckling singularity. Tuned live.
+            <para>Lowered from 0.8 (≤ 5×) when the axial height weighting landed. Two reasons, and the first is
+            the real one: this is a <em>static, single-mode</em> magnifier, and a 5× amplification is far outside
+            where such an approximation means anything — past ~1.5 the honest answer is a second-order analysis,
+            not a bigger factor. Second, it is evaluated inside a lagged dynamic loop (the mast reads the sail's
+            shape one tick late), and near the singularity the magnifier's slope is steep enough to turn that lag
+            into a runaway. The old 0.8 only ever survived because the unweighted axial sum let tensile loads low
+            on the mast cancel the masthead's pull; weighting them by height removes that accident.</para></summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.MastheadDeflection">
+            <summary>The current modal masthead deflection (m, body frame: x fore/aft, y athwart).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.BendingMast.SetMastheadDeflection(System.Single,System.Single)">
+            <summary>Set the masthead deflection directly (and zero its rate) — for the locked/prescribed bend.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.BendingMast.Integrate(System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.MastLoad},System.Single)">
+            <summary>Advance the modal oscillator by dt toward the quasi-static target masthead deflection from
+            the published loads. Quasi-implicit update (stiffness + damping implicit) — unconditionally stable
+            for any ζ, dt. dt ≤ 0 (first tick / frozen time) ⇒ no advance.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.RakeAngle_rad">
+            <summary>Aft rake: angle from vertical of the gooseneck→masthead chord (fore-aft plane), rad.
+            Aft is body -x, so an aft-raking masthead gives a positive angle. Diagnostic only.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.BendingMast.Bow_m">
+            <summary>Max perpendicular deviation of the centreline from the gooseneck→masthead chord (m).
+            Diagnostic only (≈0 while only rake/sag is driven; non-zero once a forward bow is added).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.BendingMast.AxialModalWeight(System.Single,System.Single)">
+            <summary>The share of a full-column axial load's destabilising effect that a load applied at height
+            <paramref name="a"/> actually has. Such a load is reacted at the deck clamp, so it compresses only
+            [0, a]; the work it does against the buckling mode is ∫₀^a φ′²dx as a fraction of ∫₀^L φ′²dx, and
+            φ′ = 3x(2L−x)/(2L³) integrates in closed form. 1.0 at the masthead; **0.0025 at the gooseneck**.
+            <para>Applied to every axial contribution, the sail's published loads included. Height already
+            governed the transverse path through <see cref="M:Sim.Models.Rig.BendingMast.Influence(System.Single,System.Single)"/>; before this the axial path ignored it
+            and charged a load at the gooseneck the same buckling effect as one at the masthead — a factor of
+            ~400. It matters in both directions: <c>MastLoadAssembler</c> publishes a node load at every luff
+            station starting at height 0, and the low ones carry positive (tensile) Z, so weighting them lifts
+            their cancellation of the masthead's pull and P/P_cr goes UP, not down.</para></summary>
+        </member>
+        <member name="T:Sim.Models.Rig.ClewForce">
+            <summary>
+            Pure clew-force resolve for the dynamic-leech model: the boom carries the leech tension up
+            segment 0 (clew→node 1) plus the clew node's own aero share; the along-boom inboard component is
+            what the outhaul slider resists next tick. Lifted verbatim from DynamicLeechMainsailModel. No state.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.ClewForce.Resolve(System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Numerics.Vector3,System.Numerics.Vector3)">
+            <param name="node0_B">Clew node (leech node 0), body frame.</param>
+            <param name="node1_B">Leech node 1 (segment 0 runs node0→node1).</param>
+            <param name="segTension0">Leech edge tension in segment 0.</param>
+            <param name="clewAeroShare_B">The clew corner's aero share (leechCornerForce_B[0]).</param>
+            <param name="boomDir_B">Unit boom direction, gooseneck→tip.</param>
+            <returns>The total clew force on the boom, and the along-boom inboard reaction (clamped ≥ 0).</returns>
+        </member>
+        <member name="T:Sim.Models.Rig.DynamicLeechMainsailModel">
+            <summary>
+            Mainsail whose leech is a single XPBD dynamic node system (LeechMembraneSolver), replacing the
+            free-leech model's three quasi-static solves. Composes a <see cref="T:Sim.Models.Rig.SailPanelLayout"/> for the
+            shared aero/camber/CoP/mast-load machinery and drives its own leech solve. Uses the real measured
+            leech length; the bottom edge tension pitches the boom up until taut (vang sheeting — later task).
+            M-P1/M-P2 run with the boom pinned by the caller. See spec 2026-06-09-dynamic-leech-membrane.
+            </summary>
+        </member>
+        <member name="P:Sim.Models.Rig.DynamicLeechMainsailModel.TelemetryChannels">
+            <summary>Sail-group readouts: the sail force source's net force/moment, the boom + traveler
+            trim state (the boom is the sail's spar, so its readouts live under the Sail subject), and the
+            per-strip emergent draft depth the membrane solves for.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.BuildTelemetryChannels(System.Int32)">
+            <summary>Draft depth is per strip, so the channel set depends on the cut's strip count — hence
+            built per instance. Draft <em>position</em> gets no channel while it is the fixed 0.35 peak
+            (spec §6.1); it earns one when the peak starts migrating.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.FormForceDiag_B(System.Int32)">
+            <summary>Diagnostic (J-dump): per-node form-restoring force (body frame, N) from the last substep.
+            Outward when relieving an over-deep panel, inward (shortening) when restoring an over-flat one;
+            ~zero at the design shape. Node 0 (clew) and node N (head) are pinned, so always zero.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.DesignChordDiag_m(System.Int32)">
+            <summary>Diagnostic (J-dump): the per-node design chord the model places on (de-roached).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.PanelArea_m2(System.Int32)">
+            <summary>Design planform area (m²) of panel <paramref name="i"/>, from the composed layout.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.Draft(System.Int32)">
+            <summary>Per-strip draft telemetry (Depth, Position) of strip <paramref name="i"/>, from the
+            composed layout. Depth is recomputed each tick from the emergent chord (see RecomputeDraft).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.RealLeechNode_B(System.Int32,System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3})">
+            <summary>Option A.5 (2b): the REAL (roachy) leech corner over the solved VIRTUAL node, through the
+            shared <see cref="T:Sim.Models.Rig.RoachOverlay"/> — the same call a client makes on the nodes the wire carries.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.ProjLuffDiag_W(System.Int32)">
+            <summary>Projected luff-on-chord point G (world): actualLuff + bendProj·chordHat. The constraint
+            holds |G → leech| = designChord, so G should sit on the chord, offset toward the leech by bendProj.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.BendProjDiag_m(System.Int32)">
+            <summary>Bend projection (m) added to the design chord at this node: (G_geom − actualLuff)·chordHat,
+            with athwart (body-Y) sag excluded. >0 = fore-aft bend lengthening the chord (flattening).</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.DynamicLeechMainsailModel.LeechCarry">
+            <summary>Per-tick state that crosses the tick boundary (read this tick, written last tick).
+            Gathered into one place so the 1-tick lag is explicit. NOTE: the per-strip panel depth also
+            crosses the boundary but is owned by the composed SailPanelLayout, so it stays there.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.BuildBoomForcesAndState(Sim.Models.Rig.PanelBuildResult@,System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.MastLoad},Sim.Core.Dynamics.BoatState@,Sim.Core.Boat.BoomState@,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3[])">
+            <summary>Stage 9: surface render/telemetry on the panels, resolve the clew force on the boom,
+            and assemble the published SailState.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.AssembleMastLoadsAndBend(System.Numerics.Vector3[],System.Single[],System.Single)">
+            <summary>Stages 6–7: assemble mast loads from leech tensions + luff-aero shares + form reactions,
+            then advance the (possibly bending) mast for next tick.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.SolveLeech(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3[],System.Numerics.Vector3[],System.Single)">
+            <summary>Stage 5: advance the XPBD leech under the panel leech-corner loads + cut constraints.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.SolveOuthaul(Sim.Core.Rig.SailInputs,System.Single,System.Numerics.Vector3)">
+            <summary>Stage 1: settle the clew slider from the commanded outhaul vs last tick's foot reaction.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.DynamicLeechMainsailModel.RecomputeDraft(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3})">
+            <summary>Stage 8: parameterized per-strip draft from the solved leech nodes (for next tick's aero).</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.LeechMembraneSolver">
+             <summary>
+             XPBD (extended position-based dynamics) solver for the mainsail leech as a chain of point masses
+             between two anchors. Pure dynamics — no sail/aero knowledge. The caller supplies anchors, the
+             per-segment rest lengths (the inextensible leech cloth), per-node chordwise skin caps (a luff
+             point and a max chord), per-node external forces (the leech-corner aero share), node mass,
+             constraint compliances, velocity damping, and the substep schedule. <see cref="M:Sim.Models.Rig.LeechMembraneSolver.Advance(System.Numerics.Vector3,System.Numerics.Vector3,System.ReadOnlySpan{System.Numerics.Vector3},System.ReadOnlySpan{System.Single},System.ReadOnlySpan{System.Single},System.ReadOnlySpan{System.Single},System.ReadOnlySpan{System.Numerics.Vector3},System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Int32,System.Int32)"/>
+             steps the interior nodes one sim step and exposes the new positions plus the per-segment
+             tensions (the edge-constraint multipliers), which the caller feeds to the mast/boom loads.
+            
+             Node k sits at span k/N: node 0 = clew anchor, node N = masthead anchor; nodes 1..N-1 are free.
+             </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.LeechMembraneSolver.SegmentTension(System.Int32)">
+            <summary>Per-segment edge tension (N) from the LAST substep, recovered from the converged XPBD multiplier (T = -λ/h²). Segment i joins node i,i+1; a slack edge reports 0.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.LeechMembraneSolver.FormForce(System.Int32)">
+            <summary>Per-node form-restoring force (N, body) from the LAST substep — the signed chordwise force
+            on the leech node pulling its chord toward the design chord (recovered as λ/h²). Outward (lengthening)
+            when relieving an over-deep panel, inward (shortening) when restoring an over-flat one; ~zero at the
+            design chord and at the anchors. The mast reaction is the negative of this.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.MastArc">
+            <summary>
+            Pure arc-length ↔ height inversion for a height-parameterized mast centreline. The mast exposes
+            position/tangent by height above the gooseneck; the sail wants to place luff nodes by cloth-arc
+            along the (bent) centreline. Arc length is <c>arc(h) = ∫₀ʰ dh'/t_z(h')</c> where <c>t_z</c> is the
+            z-component of the unit tangent (≤ 1 ⇒ arc ≥ height); a bent mast therefore reaches a given cloth
+            arc at a lower height (foreshortening). Stateless, model-agnostic — works off the public
+            <see cref="T:Sim.Core.Rig.IMastShape"/> height API, so any bending implementation reuses it.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.MastArc.ArcAtHeight(Sim.Core.Rig.IMastShape,System.Single,System.Int32)">
+            <summary>Cloth-arc length from the gooseneck up to <paramref name="height"/>, by trapezoid
+            integration of <c>1/t_z</c> over <paramref name="samples"/> intervals.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.MastArc.HeightForArc(Sim.Core.Rig.IMastShape,System.Single)">
+            <summary>Height above the gooseneck whose cloth-arc equals <paramref name="targetArc"/>. Seeded at
+            h = targetArc (arc ≥ height) and Newton-corrected with <c>d(arc)/dh = 1/t_z</c>; bend is small so a
+            handful of iterations converge.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.MastArc.PointAtArcLength(Sim.Core.Rig.IMastShape,System.Single)">
+            <summary>The mast point at the given cloth-arc from the gooseneck.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.MastLoadAssembler">
+            <summary>
+            Assembles the distributed 3-D loads the sail puts on the mast, from a per-strip force balance.
+            For each strip i the mast load is the closure F_mast[i] = F_aero[i] + cable@node(i+1), where
+            cable@node(i+1) = T_i·û(node[i+1]→node[i]) + T_{i+1}·û(node[i+1]→node[i+2]) is the same leech force the
+            twist solver already uses. Each contribution is lumped onto the two bracketing luff nodes by its own
+            height, conserving total force and first moment. Only the masthead node touches the mast; interior
+            leech tensions telescope away, leaving Σ loads = Σ F_aero − F_clew (the mast's share). Body frame.
+            The published Force_B is the full 3-D node load: its transverse (X,Y) share bends the mast and its
+            vertical (Z) share is the axial compression a mast model may use for P-δ amplification.
+            See spec 2026-06-06-distributed-mast-load-strip-sail-design.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Rig.MembraneEdgeSplit">
+            <summary>
+            Splits a strip's aero resultant into leech-edge and luff-edge reactions via the uniform
+            membrane-tension model (spec 2026-06-09 §6.1). The leech reaction — the edge the leech solver
+            advances — carries the chordwise INWARD pull (<c>T·cosα</c>) that deepens the draft plus its
+            leeward share (<c>T·sinα = N/2</c>); the luff reaction is the remainder <c>F − leech</c>, so the
+            two always sum to the resultant (force-conserving) and the mast load gets its draft-dependent
+            direction without a second edge angle. Below <see cref="F:Sim.Models.Rig.MembraneEdgeSplit.MinDepth"/> the cloth is too flat to
+            define <c>α</c> (<c>T→∞</c>), so it falls back to today's bilinear chord-normal split
+            (<c>u·F</c> to the leech, <c>(1−u)·F</c> to the luff).
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Rig.MembraneEdgeSplit.MinDepth">
+            <summary>Draft-depth floor below which we use the bilinear chord-normal fallback. Set tiny
+            (1e-4) — effectively removed: the membrane tension is allowed to ramp up as the sail flattens
+            (the real limit is the outhaul's max pull, not an arbitrary floor), with the fallback now only
+            guarding the genuine zero-curvature singularity (handled by the denom guard in Resolve).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.MembraneEdgeSplit.Resolve(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Single)">
+            <param name="resultant">Strip aero resultant <c>F</c> (chord-normal + friction), any frame.</param>
+            <param name="nLee">Leeward chord-normal unit vector (same frame as F).</param>
+            <param name="chordHat">Chord unit vector, luff→leech (same frame as F).</param>
+            <param name="depth">Strip draft depth <c>d</c> (max camber ÷ chord) — for the flat fallback gate.</param>
+            <param name="luffEdgeAngle">Camber tangent angle at the luff (rad). Used only as a scalar in
+            the perpendicular balance <c>T(sinα_luff + sinα_leech) = N</c>; NOT a force direction.</param>
+            <param name="leechEdgeAngle">Camber tangent angle at the leech (rad) — the direction the leech
+            membrane tension acts along. Matches the cut (shallow for a forward draft).</param>
+            <param name="cop_u">Centre-of-pressure chord fraction, for the flat fallback split.</param>
+            <returns>(leech, luff) reactions; <c>leech + luff == resultant</c>.</returns>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelAeroCoefficients">
+            <summary>Aero coefficient bundle for one strip evaluation — the live-tunable polar inputs the
+            panel-discretised sail model carries as <see cref="T:Sim.Core.Configuration.IConfigurable"/> parameters. Passed
+            per call (not snapshotted) so live retuning is reflected immediately.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.PanelAeroCoefficients.#ctor(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>Aero coefficient bundle for one strip evaluation — the live-tunable polar inputs the
+            panel-discretised sail model carries as <see cref="T:Sim.Core.Configuration.IConfigurable"/> parameters. Passed
+            per call (not snapshotted) so live retuning is reflected immediately.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelAero">
+            <summary>Result of one strip aero evaluation (chord-normal force + diagnostic lift/drag split).</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelAeroEvaluator">
+            <summary>
+            Stateless aero kernel for one sail strip. Given already-resolved world-frame geometry (chord and
+            span directions, planform area, emergent vs design chord) plus the strip's draft and the polar
+            coefficients, it returns the chord-normal force and its lift/drag split. No model, mast, or boom
+            state — the sail model resolves geometry and calls this; tests drive it directly with
+            controlled inputs. The math is lifted verbatim from the model's former ComputePanelAero body.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelBuildResult">
+            <summary>Outputs of the dynamic-leech per-panel build/aero/edge-split loop, gathered into one
+            named value instead of ~8 loose parallel arrays. Arrays are N or N+1 as noted.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.PanelBuildResult.#ctor(Sim.Core.Rig.SailPanelState[],System.Numerics.Vector3[],System.Numerics.Vector3[],System.Numerics.Vector3[],System.Numerics.Vector3[],System.Single[],System.Numerics.Vector3,Sim.Core.Rig.SailMode)">
+            <summary>Outputs of the dynamic-leech per-panel build/aero/edge-split loop, gathered into one
+            named value instead of ~8 loose parallel arrays. Arrays are N or N+1 as noted.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelCornerLoad">
+            <summary>
+            Conservative CoP-weighted bilinear split of a panel aero resultant onto the panel's four corners.
+            `u` is the centre-of-pressure chord fraction (0 at the luff, 1 at the leech); `v` is the spanwise
+            fraction (0 at the lower edge, 1 at the upper). The four weights are non-negative, sum to 1, and
+            reproduce the CoP point, so Σ corner forces = F and the first moment (the CoP location) is
+            conserved. Returns (luffLow, luffUp, leechLow, leechUp).
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Rig.PanelPlanform">
+            <summary>
+            Pure planform geometry for one sail strip, from its four world-frame corners (Part C / C2). The mast
+            bends in x AND y and the leech twists, so the corners are generally NON-coplanar. The span is the luff
+            edge (the sail's generating line — twist is defined about it); the chord is the real mid-chord
+            (leech-mid − luff-mid, carrying twist/bend/outhaul); the area is the triangulated skew quad. The aero
+            kernel strips any along-span tilt out of the chord, so chord need not be perpendicular to span.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Rig.RoachOverlay">
+             <summary>
+             Pure roach overlay: the REAL (roachy) leech corners reconstructed from the solved VIRTUAL leech —
+             virtualNode + roach·n̂, where n̂ is the aft normal in the sail plane (the chord component ⟂ the local
+             leech tangent). Identity on a cut with no roach. No model state.
+             </summary>
+             <remarks>
+             <para>The tension still solves on the virtual (de-roached) leech; only the published corners — aero
+             and render — get the overlay. The roach DISTANCE is read from the cut and never re-derived: the chord
+             only orients the offset, its length dropped by the normalize. The overlay is rigid, so it reproduces
+             the real chord in the design pose and approximates it as the leech stretches.</para>
+            
+             <para><b>Which is why it is derived, and why the wire carries the virtual leech.</b> Every input is
+             the solved nodes, the luff and the static cut, so a client holding those calls this and gets the
+             solver's own corners — and feeds the VIRTUAL nodes it was sent to <see cref="T:Sim.Models.Rig.StripDraft"/>, which is
+             the leech that call has always wanted. Publishing the roachy corners instead left a client with a
+             chord ~12% long on the ILCA cut and a reconstructed draft of exactly zero.</para>
+             </remarks>
+        </member>
+        <member name="M:Sim.Models.Rig.RoachOverlay.Apply(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},Sim.Models.Rig.SailPanelLayout)">
+            <summary>Every real corner of a sail composed on <paramref name="layout"/>, N+1 of them.</summary>
+            <param name="virtual_B">Solved leech nodes, N+1 (0 = clew, N = masthead), body frame — the
+            structural tension path, before any roach.</param>
+            <param name="luff_B">Luff points at each node span, N+1, body frame —
+            <see cref="M:Sim.Models.Rig.SailPanelLayout.LuffNodes_B"/>.</param>
+        </member>
+        <member name="M:Sim.Models.Rig.RoachOverlay.Node_B(System.Int32,System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Single})">
+            <param name="roach_m">Per-node roach width from the cut, N+1.</param>
+            <inheritdoc cref="M:Sim.Models.Rig.RoachOverlay.Apply(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},Sim.Models.Rig.SailPanelLayout)"/>
+        </member>
+        <member name="T:Sim.Models.Rig.SailPanelLayout">
+            <summary>
+            Shared per-panel geometry + flat-plate aero machinery for the mainsail models: panel corners,
+            design chord/camber, apparent wind, per-panel aero, mast-load integration and the sail inertia
+            contribution. Extracted so a composing model can own it instead of inheriting it. Holds no
+            leech-solver state — that stays with the model that solves the leech.
+            </summary>
+        </member>
+        <member name="F:Sim.Models.Rig.SailPanelLayout._mesh">
+            <summary>Per-node design mesh (sub-project C). Consumed by BuildPanelGeometry / ComputePanelAero.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.Rig">
+            <summary>The rig geometry this layout was built on.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.Mast">
+            <summary>The (possibly bending) mast the luff is placed on.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.Mesh">
+            <summary>The per-node design mesh (skin / roach / virtual-skin) this layout was built on.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.IntegrateMast(System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.MastLoad},System.Single)">
+            <summary>Advance the (possibly bending) mast from this tick's assembled mast loads. A composing
+            model that assembles its own loads calls this; RigidMast.Integrate is a no-op.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.DesignChord_m(System.Int32)">
+             <summary>The cut's design straight chord (draft-applied) at luff node <paramref name="k"/> = skin ÷
+             ArcLengthRatio(draft). The single chord source for placement and the form-restoring reference (#1.5).
+            
+             <para>DE-ROACHED (Option A.5): the model places and cambers on the virtual leech — the straight tension
+             path, which does not manufacture roach-curvature forces — and the roach goes back on as an overlay for
+             aero/render. This was once switchable; the real-leech position had no coherent rest to solve against
+             once the cut stopped carrying real leech segments, so the virtual leech is simply the model now.
+             Planform area still uses the REAL chord (<see cref="F:Sim.Models.Rig.SailPanelLayout._designChord"/>) — the roach is sail area even
+             though it bears no tension.</para></summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.DesignChordDiag_m(System.Int32)">
+            <summary>Diagnostic (J-dump): the per-node design chord the model places on (de-roached).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.Panel(System.Int32)">
+            <summary>Static per-panel geometry (span/chord fractions, area, z-band) of panel <paramref name="i"/>.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.PanelDepth(System.Int32)">
+            <summary>Current draft depth (max camber ÷ chord) of strip <paramref name="i"/>.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.Draft(System.Int32)">
+            <summary>Per-strip draft telemetry: (Depth, Position) where Depth = max camber ÷ chord and
+            Position = fraction of chord at which max camber occurs — read from the section rather than
+            repeated, since <c>CamberSection.Position</c> is documented as becoming tension-driven later.
+            A composing model recomputes Depth each tick from the emergent chord.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.LuffPoint_B(System.Single)">
+            <summary>
+            Body-frame position of the luff (mast) at a given span fraction (0 = tack/gooseneck,
+            1 = head/masthead). This is the bend-ready seam: Spec A returns the straight, undeflected
+            mast (vertical above the gooseneck); Spec B (mast bend) will make this deflect under load,
+            and the leech/luff geometry that reads it will follow with no other changes.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.LuffNodeArc(System.Int32)">
+            <summary>Mast cloth-arc (from the gooseneck) at luff node k, with the luff anchored at the MAST TIP:
+            the head sits at the masthead and the tack hangs the cut's total luff cloth below it — the Laser
+            sleeve + cunningham, no load-bearing gooseneck tack (the bottom anchor is the clew on the boom).
+            δ = (mast arc to the masthead) − (total luff cloth) is the tack's rise above the gooseneck; on a
+            straight mast whose frame luff equals the cloth, δ = 0 (tack at the gooseneck, legacy-identical).</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.MastheadAnchor_B">
+            <summary>Body-frame masthead position — the leech's top anchor (= <c>LuffPoint_B(1)</c>).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.LuffNodes_B">
+            <summary>The luff point at every leech node's span, N+1 of them, tack first — the sail's forward
+            edge as the geometry that reads it wants it. One definition because both the solver and a client
+            reconstructing a remote sail need exactly this array, and a second copy of the walk could place
+            the same numbers on two different masts.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.PanelCount">
+            <summary>Number of equal-span panels (= leech segments). Node count is <c>PanelCount + 1</c>.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.SpanFractionUpper(System.Int32)">
+            <summary>Upper span fraction of panel <paramref name="i"/> (leech node <c>i+1</c> sits here).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.LeechSegmentRest_m(System.Int32)">
+             <summary>The cut's per-segment design (flying) leech chord — segment <paramref name="i"/>'s rest
+             length (C5): the design distance between adjacent VIRTUAL leech nodes with camber applied, taken
+             as-is (both shape and scale). De-roached, matching the virtual leech the tension solves on, so the
+             leech sits at exactly zero tension in the design shape and goes slack (top twists off) as the
+             geometry closes on it.
+            
+             <para>NOT rescaled to the measured leech cloth (<c>SailMeasurements.Leech_m</c>): that measurement
+             is the arc along the REAL, roachy leech, which is longer than the de-roached tension path.
+             Stretching the rest out to the roachy arc would hand the leech ~2% (~0.1 m) of slack it does not
+             physically have — the roach is battened cloth carried OUTSIDE the tension path (a
+             <c>Roach_m</c> overlay), not extra length along it.</para></summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.SkinLength_m(System.Int32)">
+            <summary>Chordwise skin (cloth) length of strip <paramref name="i"/> — the C1 seed cloth.</summary>
+        </member>
+        <member name="P:Sim.Models.Rig.SailPanelLayout.Camber">
+            <summary>Camber geometry shared with C1 (depth ↔ arc-length-ratio).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.SetPanelDepth(System.Int32,System.Single)">
+            <summary>Set strip <paramref name="i"/>'s current draft depth (the free-leech model recomputes
+            this from the emergent chord each tick).</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.ComputePanelCorners_B(System.Int32,Sim.Core.Boat.BoomState@,System.Single,System.Numerics.Vector3@,System.Numerics.Vector3@,System.Numerics.Vector3@,System.Numerics.Vector3@)">
+            <summary>
+            Compute the four body-frame corners of panel i at the given twist about its luff edge.
+            Every panel — including the bottom — rotates the chord by twist about the panel's local
+            luff tangent (body +z on a straight mast, tilts with rake/bend). The bottom panel's
+            lower-leech corner (the clew) is anchored to the boom
+            by an explicit override in the caller (per-tick build + leech-state node 0), since
+            the foot is rigidly attached to the boom regardless of any internal panel twist.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.ApparentWindAt(System.Numerics.Vector3,Sim.Core.Dynamics.BoatState@,Sim.Core.Boat.BoomState@,Sim.Core.Environment.IWindField,System.Single)">
+            <summary>
+            Wind relative to the CLOTH at a point: the true wind less the velocity of the sail material
+            there. The sail moves for two reasons — the hull carries it, and the boom swings it — and the
+            aero only knows what it is given. Omitting the swing leaves the rig with no aero damping at all:
+            the sail could push the boom but never resist it, so the boom swung like a frictionless pendulum
+            and sat backed on the windward side half the time.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.SailSwingVelocity_W(System.Numerics.Vector3,Sim.Core.Dynamics.BoatState@,Sim.Core.Boat.BoomState@)">
+            <summary>
+            Velocity of the sail material at a point from the boom's swing alone (world frame).
+            <para>The yaw axis runs vertically through the gooseneck — that is, along the mast — so swinging
+            the boom rotates the whole sail about its own luff: the leech sweeps a full chord's worth while
+            the luff, sitting on the axis, stays put. The cross product gives that for free, with no need to
+            weight anything by chord fraction.</para>
+            <para>Pitch is deliberately left out. About the gooseneck it is NOT a rotation of the sail — it
+            would sweep the masthead, which is pinned — and modelling it honestly needs a height-weighted
+            term. Boom pitch is slow and the vang already damps it, so the swing term carries the physics
+            that matters.</para>
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.Coefficients">
+            <summary>Current polar coefficients as a bundle for <see cref="T:Sim.Models.Rig.PanelAeroEvaluator"/> — read live
+            from the IConfigurable fields so retuning is reflected immediately.</summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailPanelLayout.BuildInertiaContribution(Sim.Core.Boat.BoomState@)">
+            <summary>Per-§20 inertia contribution for the panel-discretised sail. CoM sits at the
+            area-weighted centroid in body frame, computed from panel z-band centroids and
+            panel areas. <see cref="T:Sim.Core.Boat.BoomState"/> rotates the centroid forward/aft along the
+            boom direction so the mass swings with the boom.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.SailSurfaceMesh">
+             <summary>
+             Pure (renderer-agnostic) construction of the sail surface vertex grid from per-panel
+             <see cref="T:Sim.Core.Rig.SailPanelState"/> quads + a per-height draft schedule. Produces the world-frame
+             cambered surface (chordwise camber from <see cref="M:Sim.Core.Rig.CamberSection.CamberLine(System.Single,System.Single)"/>, spanwise twist
+             from per-edge normals). Kept here (no engine dependency) so the surface geometry is unit-testable —
+             e.g. a uniform "square" sail must produce a uniform cambered wing.
+            
+             <para><b>This is the reference, not the renderer.</b> Godot draws the sail by porting the same
+             arithmetic into <c>sail.gdshader</c> and displacing a static grid on the GPU, and a C++ engine is
+             expected to port it too. Nothing calls this at render time any more. What it earns its place doing
+             is answering what the surface IS: its tests pin the geometry, and the committed cross-language
+             fixture carries a grid built from it, so a port can be diffed against an answer rather than an
+             opinion.</para>
+            
+             The spanwise spine (the luff and leech edge lines) is interpolated with a centripetal Catmull-Rom
+             spline through the panel corner nodes, so the surface curves smoothly (C1) across panel boundaries
+             instead of reading as a faceted polyline. The nodes are unchanged — the spline passes through them
+             exactly, so the physics (which reads the panel corners, not this mesh) is unaffected; only the
+             rendered path *between* nodes bows. Collinear nodes (e.g. a straight square sail) collapse back to
+             the original straight lerp.
+             </summary>
+        </member>
+        <member name="M:Sim.Models.Rig.SailSurfaceMesh.BuildWorldVertices(System.Collections.Generic.IReadOnlyList{Sim.Core.Rig.SailPanelState},System.Int32,System.Int32,System.Func{System.Single,System.Single},Sim.Core.Rig.CamberSection,System.Int32@)">
+            <summary>
+            Build the world-frame vertex grid: <c>totalRows = N·spanSubdiv + 1</c> rows (foot→head) ×
+            <paramref name="chordSubdiv"/> columns (luff→leech). Adjacent panels share their boundary row.
+            </summary>
+            <param name="panels">Per-panel corner quads (world frame).</param>
+            <param name="spanSubdiv">Span subdivisions per panel (≥ 1).</param>
+            <param name="chordSubdiv">Chord subdivisions (≥ 2).</param>
+            <param name="depthAtHeight">Draft depth (max camber ÷ chord) at a span height fraction [0,1].
+            The caller folds any mode draft-scale into this.</param>
+            <param name="camber">Section shape (depth → camber line). Shared with the physics.</param>
+            <param name="totalRows">Out: number of rows in the grid.</param>
+        </member>
+        <member name="M:Sim.Models.Rig.SailSurfaceMesh.CatmullRomSegment(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Int32,System.Single)">
+            <summary>Evaluate the centripetal Catmull-Rom spline on segment <paramref name="i"/> (between
+            control points <c>cps[i]</c> and <c>cps[i+1]</c>) at local parameter <paramref name="t"/> ∈ [0,1].
+            Endpoints use reflected phantom points so the foot/head segments stay well-shaped. The spline
+            interpolates every control point exactly (so panel nodes stay on the surface) and is C1 across
+            boundaries; collinear control points reduce to a straight lerp.</summary>
+        </member>
+        <member name="T:Sim.Models.Rig.StripDraft">
+            <summary>
+            Pure per-strip draft from emergent geometry: each strip's depth from its representative chord
+            (straight luff→leech) and its fixed chordwise skin (cloth) length, via the camber arc-length ratio.
+            Lifted verbatim from DynamicLeechMainsailModel's former RecomputeDraft loop. No model state.
+            </summary>
+            <remarks>Draft therefore never crosses the wire: a client holding the sail's two edges and the
+            static cut calls <see cref="M:Sim.Models.Rig.StripDraft.Compute(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},Sim.Models.Rig.SailPanelLayout)"/>
+            and gets the solver's own answer, from the solver's own code.</remarks>
+        </member>
+        <member name="M:Sim.Models.Rig.StripDraft.Compute(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},Sim.Models.Rig.SailPanelLayout)">
+            <summary>The whole call the solver makes, for a sail composed on <paramref name="layout"/> — the
+            skin/chord pairing below is part of the answer, so it lives here rather than at each call site
+            where two copies could drift.</summary>
+            <param name="nodes_B">Solved leech nodes, N+1 (0 = clew, N = masthead), body frame.</param>
+            <param name="luff_B">Luff points at each node span, N+1, body frame —
+            <see cref="M:Sim.Models.Rig.SailPanelLayout.LuffNodes_B"/>.</param>
+        </member>
+        <member name="M:Sim.Models.Rig.StripDraft.Compute(System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Collections.Generic.IReadOnlyList{System.Numerics.Vector3},System.Single,System.Collections.Generic.IReadOnlyList{System.Single},System.Single,Sim.Core.Rig.CamberSection)">
+            <param name="nodes_B">Leech nodes, N+1 (0 = clew, N = masthead), body frame.</param>
+            <param name="luff_B">Luff points at each node span, N+1, body frame.</param>
+            <param name="footSkin_m">Foot strip's chordwise cloth length (overrides skinLengths_m[0]).</param>
+            <param name="skinLengths_m">Per-strip chordwise cloth length; index 0 is IGNORED for the foot
+            strip (the foot always uses <paramref name="footSkin_m"/>); only indices 1..N-1 are read.</param>
+            <param name="headChord_m">Head design chord — substituted for the top strip's degenerate masthead
+            corner where node ≡ luff (chord 0).</param>
+            <returns>A <c>float[]</c> of length N (= nodes_B.Count - 1) where index i is strip i's draft
+            depth (max camber ÷ chord).</returns>
+        </member>
+        <member name="T:Sim.Models.Util.FoilInertia">
+            <summary>
+            Derives a foil's rigid-body inertia (§20) from its geometry and a known mass, replacing the
+            hand-tuned principal-inertia constants the foil models used to carry. The foil's unit-density
+            section-integrated inertia (<see cref="M:Sim.Core.Appendage.FoilGeometry.InertiaShape"/>) is scaled by an effective
+            density back-solved from the specified mass (<c>ρ = mass / volume</c>), so the mass stays a
+            familiar handle while the inertia is physically distributed by the real planform + NACA section.
+            </summary>
+            <remarks>
+            <see cref="T:Sim.Core.Dynamics.ComponentInertia"/> stores only a diagonal principal inertia plus a
+            <c>LocalToBody</c> rotation that <see cref="T:Sim.Core.Dynamics.InertiaComposer"/> reconstructs the tensor from
+            (<c>R·diag·Rᵀ</c>). We factor the geometric tensor with <see cref="T:Sim.Core.Dynamics.SymmetricEigen"/> for the true
+            principal values, then assign each principal axis to the foil's chord (x) / section-normal (y) /
+            span (z) basis so the diagonal ordering is deterministic and the y axis stays the section normal
+            — keeping the broadside added-mass convention (<see cref="T:Sim.Models.Appendage.FoilAddedMass"/>) consistent under the
+            shared <c>LocalToBody</c>.
+            </remarks>
+        </member>
+        <member name="M:Sim.Models.Util.FoilInertia.FromMass(Sim.Core.Appendage.FoilGeometry,System.Single)">
+            <summary>
+            Build the foil's <see cref="T:Sim.Core.Dynamics.ComponentInertia"/> (mass, body-frame CoM, principal inertia in
+            the chord/normal/span order) and the principal-axis <c>LocalToBody</c> rotation for a foil of
+            the given <paramref name="mass_kg"/>. The returned rotation maps the chord/normal/span
+            principal frame into the geometry's (body-aligned) local frame; callers compose any extra
+            orientation (e.g. a rudder's helm rotation about its stock) onto it before publishing.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilInertia.PickAligned(System.Numerics.Vector3[],System.Single[],System.Boolean[],System.Numerics.Vector3)">
+            <summary>Pick the as-yet-unused eigenvector most aligned with <paramref name="target"/>,
+            sign-flipped to point the same way, and return it with its eigenvalue.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilInertia.QuaternionFromColumns(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3)">
+            <summary>Quaternion whose rotation matrix has the given orthonormal columns (Shepperd's
+            method, column-convention to match <see cref="M:Sim.Core.Dynamics.Matrix3x3.FromQuaternion(System.Numerics.Quaternion)"/>).</summary>
+        </member>
+        <member name="T:Sim.Models.Util.FoilPolar">
+             <summary>
+             Finite-wing foil polar (lift &amp; induced-drag coefficients vs. angle of attack)
+             shared by all hydrodynamic-lifting-surface models — keel/daggerboard, rudder, and
+             any future foils. Replaces the AR-independent <c>Cl = Cl_max·sin(2α)</c> placeholder
+             previously inlined in <c>ParametricKeelModel</c> / <c>ParametricRudderModel</c>.
+             </summary>
+             <remarks>
+             <para><b>Pre-stall (|α| ≤ α_stall):</b> linear lifting-line theory.
+             <c>Cl = a_3D · α</c> with finite-wing slope
+             <c>a_3D = 2π·AR/(AR+2)</c> (per radian). Induced drag is lift-coupled:
+             <c>Cd_i = Cl² / (π·AR·e)</c> where <c>e</c> is the Oswald span efficiency
+             (typical 0.75–0.95).</para>
+            
+             <para><b>Post-stall / reverse (|α| &gt; α_stall):</b> inviscid flat-plate
+             <c>Cl = Cl_max·sin(2α)</c>, peaking at <c>Cl_max</c> at 45°, tapering to zero at 90°, and
+             continued symmetrically into the reverse half (sign-flipping). There is a downward step at
+             the stall angle (<c>Cl_max → Cl_max·sin(2α_stall)</c>) — the physical stall drop; the model
+             is intentionally not C1- or C0-continuous there. Normal-force form drag
+             <c>Cd_form = Cd_n90·t²</c> tents about broadside via <c>t = (δ−α_stall)/(π/2−α_stall)</c>
+             with <c>δ = min(|α|, π−|α|)</c>, so it peaks at α=90° and returns to zero as the flow
+             re-aligns from behind. The stall flag covers the separated mid-band
+             <c>α_stall &lt; |α| &lt; π−α_stall</c> only.</para>
+            
+             <para><b>Fore-aft symmetry (modeling simplification).</b> The post-stall lift is continued
+             symmetrically across the full angle range, so the section is treated as fore-aft symmetric:
+             reverse-flow lift (|α| &gt; 90°, flow over the trailing edge) has the same magnitude as
+             forward-flow lift at the supplementary angle. A real foil is not fore-aft symmetric — its
+             rounded leading edge and sharp trailing edge mean that in reverse the sharp edge leads,
+             tripping earlier separation, so a real keel/rudder makes less lift and more drag backing up
+             than going forward. We deliberately omit this: reverse is low-speed maneuvering where forces
+             (∝ V²) are small, and the lift direction — the thing that makes reverse steering work — is
+             already correct. If higher reverse fidelity is ever needed, attenuate the reverse half with
+             a per-foil <c>ReverseLiftEfficiency</c> factor; it can be applied as a step at α=90° without a
+             discontinuity, since Cl=0 there. (The center-of-pressure migration, by contrast, IS
+             quadrant-aware — see <see cref="M:Sim.Models.Util.FoilPolar.CenterOfPressureMigrationFraction(System.Single)"/> — and is not waived by
+             this simplification.)</para>
+            
+             <para><b>Center of pressure</b> migrates aft from the aerodynamic center (c/4) at α=0,
+             through the centroid (c/2) at broadside (α=±90°), and on toward c·¾ in full reverse
+             (α=±180°) — modeled by <see cref="M:Sim.Models.Util.FoilPolar.CenterOfPressureMigrationFraction(System.Single)"/> as a quadrant-aware
+             <c>0.25·(1−cos α)</c> shift aft of the static offset (so absolute <c>x_CoP/c = 0.5 −
+             0.25·cos α</c> for a quarter-chord static CoP). Used by the rudder model to give a
+             physically-correct stock-torque feel that strengthens through stall and keeps migrating
+             aft when the flow reverses.</para>
+             </remarks>
+        </member>
+        <member name="M:Sim.Models.Util.FoilPolar.LiftSlope(System.Single)">
+            <summary>Finite-wing 3D lift-curve slope (per radian).
+            <c>a_3D = 2π · AR / (AR + 2)</c>. For AR=∞ this is 2π; for AR=4 it's ≈4.19;
+            for AR=2 it's ≈3.14.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilPolar.StallAngle(System.Single,System.Single)">
+            <summary>Angle of attack at which linear theory hits <c>Cl_max</c> (rad).
+            For a Laser daggerboard (AR≈7, Cl_max≈1.5) this is ≈17°; rudder (AR≈3,
+            Cl_max≈1.0) is ≈15°.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilPolar.CenterOfPressureMigrationFraction(System.Single)">
+            <summary>Chord-fraction the center of pressure migrates AFT of its static (α=0) position
+            as the angle of attack grows: <c>0.25·(1 − cos α)</c>. 0 at α=0, 0.25 at broadside
+            (±90°), 0.5 at full reverse (±180°) — so the absolute CoP runs ¼-chord → mid-chord →
+            ¾-chord. Quadrant-aware (uses cos of the SIGNED angle), so the CoP keeps moving aft
+            through reverse rather than folding back; even in α (same both tacks). Multiply by chord
+            and add to the static CoP offset.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilPolar.Evaluate(System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>
+            Evaluate the polar at the given angle of attack and aspect ratio.
+            Returns the signed lift coefficient, the induced (lift-coupled) drag coefficient,
+            the post-stall normal-force form drag coefficient (separately, so the two can be
+            gated independently — see <see cref="T:Sim.Core.Dynamics.PhysicsToggles"/>), and
+            whether the section is stalled. The previous single drag coefficient is simply
+            <c>CdInduced + CdForm</c>. Parasitic skin-friction drag is handled separately by the
+            caller (it's Re-dependent, AoA-independent).
+            </summary>
+            <param name="alpha">Angle of attack, radians; signed.</param>
+            <param name="aspectRatio">Geometric AR = span²/area = span/chord for a rectangular
+            planform. Use <i>immersed</i> span when partially retracted or partially wetted.</param>
+            <param name="clMax">Peak section lift coefficient — sets stall onset.</param>
+            <param name="spanEfficiency">Oswald span efficiency factor <c>e</c>; 0.85 is a
+            reasonable default for a clean rectangular foil.</param>
+            <param name="cdNormal90">Drag coefficient at α=90° (broadside flat plate); ~2.0
+            is the inviscid value. Caller can tune lower for streamlined sections that delay
+            full separation.</param>
+        </member>
+        <member name="T:Sim.Models.Util.FoilSolver">
+            <summary>
+            Stateless §15 hydrodynamic solver for a wetted lifting surface. Consumed by every
+            foil-type appendage model (keel, rudder, future canting keels / cassette rudders / etc.).
+            The solver assumes its inputs describe what's <i>actually in the flow</i> — the calling
+            component is responsible for trimming the wet segment to whatever is appropriate (waves,
+            hull-bottom shielding, retraction, kick-up, cassette state, …) and for the span-fraction
+            range that wet segment occupies on the full planform. AR is computed from the wet
+            sub-planform; per-strip chord, thickness, section Cl_max, and form factor are sampled from
+            the station <see cref="T:Sim.Core.Appendage.FoilGeometry"/> so taper is honoured strip-by-strip. Lift, induced
+            drag, parasitic skin friction, buoyancy, CoP migration, and (optionally) stock torque are
+            integrated in one place so every foil sees identical physics.
+            </summary>
+            <remarks>
+            Inertia, mass, and the choice of <i>where</i> the wet segment starts and ends are the
+            component's responsibility — they vary by foil type (canting keel rotates its body-frame
+            span direction; cassette rudder's wet segment depends on lift state; etc.). The solver
+            only does the hydrodynamics on whatever surface is handed to it.
+            </remarks>
+        </member>
+        <member name="M:Sim.Models.Util.FoilSolver.Solve(Sim.Models.Util.FoilSolverInputs@)">
+            <summary>Compute lift, drag, buoyancy, and (optionally) stock torque on a wetted foil.
+            Pure function — no aggregator side effects. Caller applies the returned strip forces
+            and buoyancy to its aggregator.</summary>
+        </member>
+        <member name="T:Sim.Models.Util.FoilPolarParameters">
+            <summary>Polar parameters bundled for the solver. Section Cl_max is no longer carried here —
+            it is derived per strip from the local NACA thickness ratio (<see cref="M:Sim.Models.Util.NacaSection.SectionClMax(System.Single)"/>).</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilPolarParameters.#ctor(System.Single,System.Single)">
+            <summary>Polar parameters bundled for the solver. Section Cl_max is no longer carried here —
+            it is derived per strip from the local NACA thickness ratio (<see cref="M:Sim.Models.Util.NacaSection.SectionClMax(System.Single)"/>).</summary>
+        </member>
+        <member name="T:Sim.Models.Util.FoilSolverInputs">
+            <summary>Everything the <see cref="T:Sim.Models.Util.FoilSolver"/> needs. The wet segment must be the
+            portion of the foil actually exposed to flow — the calling component is responsible for
+            hull-bottom clipping, wave clipping, retraction, kick-up, etc. — and
+            <see cref="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac0"/>/<see cref="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac1"/> tell the solver where that wet segment
+            sits on the full planform so it can sample the tapered chord / thickness per strip.</summary>
+            <param name="WetSegment">The foil's wetted segment (world frame). Length = 0 short-
+            circuits to an empty result.</param>
+            <param name="ChordDirection_W">Unit vector along the foil's chord, world frame. For a
+            fixed foil, just <c>boat.Orientation × (-1, 0, 0)</c>; for a rotating foil (rudder),
+            includes the rotation contribution from helm/cant/kick angle.</param>
+            <param name="SpanDirection_W">Unit vector along the foil's span, world frame. Used to
+            project the inflow into the span-normal plane so lift scales correctly with heel/cant
+            (infinite-yawed-wing approximation: span-parallel crossflow produces no lift). For a
+            rudder this follows boat heel only — helm rotates the foil about the stock (≈span)
+            axis, leaving the span direction unchanged.</param>
+            <param name="Geometry">Station-based planform; sampled per strip for chord, thickness ratio,
+            section Cl_max, and form factor (taper), and integrated for wet planform / volume / area.</param>
+            <param name="WetSpanFrac0">Span fraction (0 = root, 1 = tip) of the wet segment's start
+            (root-most wet point) on the full planform.</param>
+            <param name="WetSpanFrac1">Span fraction of the wet segment's end (tip-most wet point).</param>
+            <param name="CopAftOfStock_m">Static chord-wise CoP offset from the strip span centroid,
+            measured along <see cref="P:Sim.Models.Util.FoilSolverInputs.ChordDirection_W"/>. 0 for a fixed foil where the
+            "stock" concept doesn't apply (forces act on the span centerline); ≈quarter-chord for an
+            unbalanced transom-hung rudder where the stock is at the leading edge. Dynamic α-driven
+            migration is added on top of this baseline inside the solver.</param>
+            <param name="StockAxis_W">Optional unit axis (world frame) about which to integrate stock
+            torque. <c>null</c> if the component doesn't care about stock torque.</param>
+            <param name="StockPoint_W">Optional point on the stock axis (world frame). Must be set
+            whenever <see cref="P:Sim.Models.Util.FoilSolverInputs.StockAxis_W"/> is set.</param>
+            <param name="Polar">Polar parameters (span efficiency, broadside form drag).</param>
+            <param name="Body">Boat rigid-body state, for computing local inflow at each strip via
+            <c>v_strip = waves.OrbitalVelocity(strip) − (v_cg + ω × (strip − cg))</c>.</param>
+            <param name="Waves">Wave field for orbital-velocity sampling.</param>
+            <param name="Time">Simulation time.</param>
+            <param name="StripCount">Number of strips along the wet segment. ≥1.</param>
+            <param name="WaterDensity">kg/m³.</param>
+            <param name="KinematicViscosity">m²/s.</param>
+        </member>
+        <member name="M:Sim.Models.Util.FoilSolverInputs.#ctor(Sim.Core.Appendage.ImmersedSegment,System.Numerics.Vector3,System.Numerics.Vector3,Sim.Core.Appendage.FoilGeometry,System.Single,System.Single,System.Single,System.Nullable{System.Numerics.Vector3},System.Nullable{System.Numerics.Vector3},Sim.Models.Util.FoilPolarParameters,Sim.Core.Dynamics.BoatState,Sim.Core.Environment.IWaveField,System.Single,System.Int32,System.Single,System.Single,Sim.Core.Dynamics.PhysicsToggles)">
+            <summary>Everything the <see cref="T:Sim.Models.Util.FoilSolver"/> needs. The wet segment must be the
+            portion of the foil actually exposed to flow — the calling component is responsible for
+            hull-bottom clipping, wave clipping, retraction, kick-up, etc. — and
+            <see cref="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac0"/>/<see cref="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac1"/> tell the solver where that wet segment
+            sits on the full planform so it can sample the tapered chord / thickness per strip.</summary>
+            <param name="WetSegment">The foil's wetted segment (world frame). Length = 0 short-
+            circuits to an empty result.</param>
+            <param name="ChordDirection_W">Unit vector along the foil's chord, world frame. For a
+            fixed foil, just <c>boat.Orientation × (-1, 0, 0)</c>; for a rotating foil (rudder),
+            includes the rotation contribution from helm/cant/kick angle.</param>
+            <param name="SpanDirection_W">Unit vector along the foil's span, world frame. Used to
+            project the inflow into the span-normal plane so lift scales correctly with heel/cant
+            (infinite-yawed-wing approximation: span-parallel crossflow produces no lift). For a
+            rudder this follows boat heel only — helm rotates the foil about the stock (≈span)
+            axis, leaving the span direction unchanged.</param>
+            <param name="Geometry">Station-based planform; sampled per strip for chord, thickness ratio,
+            section Cl_max, and form factor (taper), and integrated for wet planform / volume / area.</param>
+            <param name="WetSpanFrac0">Span fraction (0 = root, 1 = tip) of the wet segment's start
+            (root-most wet point) on the full planform.</param>
+            <param name="WetSpanFrac1">Span fraction of the wet segment's end (tip-most wet point).</param>
+            <param name="CopAftOfStock_m">Static chord-wise CoP offset from the strip span centroid,
+            measured along <see cref="P:Sim.Models.Util.FoilSolverInputs.ChordDirection_W"/>. 0 for a fixed foil where the
+            "stock" concept doesn't apply (forces act on the span centerline); ≈quarter-chord for an
+            unbalanced transom-hung rudder where the stock is at the leading edge. Dynamic α-driven
+            migration is added on top of this baseline inside the solver.</param>
+            <param name="StockAxis_W">Optional unit axis (world frame) about which to integrate stock
+            torque. <c>null</c> if the component doesn't care about stock torque.</param>
+            <param name="StockPoint_W">Optional point on the stock axis (world frame). Must be set
+            whenever <see cref="P:Sim.Models.Util.FoilSolverInputs.StockAxis_W"/> is set.</param>
+            <param name="Polar">Polar parameters (span efficiency, broadside form drag).</param>
+            <param name="Body">Boat rigid-body state, for computing local inflow at each strip via
+            <c>v_strip = waves.OrbitalVelocity(strip) − (v_cg + ω × (strip − cg))</c>.</param>
+            <param name="Waves">Wave field for orbital-velocity sampling.</param>
+            <param name="Time">Simulation time.</param>
+            <param name="StripCount">Number of strips along the wet segment. ≥1.</param>
+            <param name="WaterDensity">kg/m³.</param>
+            <param name="KinematicViscosity">m²/s.</param>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.WetSegment">
+            <summary>The foil's wetted segment (world frame). Length = 0 short-
+            circuits to an empty result.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.ChordDirection_W">
+            <summary>Unit vector along the foil's chord, world frame. For a
+            fixed foil, just <c>boat.Orientation × (-1, 0, 0)</c>; for a rotating foil (rudder),
+            includes the rotation contribution from helm/cant/kick angle.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.SpanDirection_W">
+            <summary>Unit vector along the foil's span, world frame. Used to
+            project the inflow into the span-normal plane so lift scales correctly with heel/cant
+            (infinite-yawed-wing approximation: span-parallel crossflow produces no lift). For a
+            rudder this follows boat heel only — helm rotates the foil about the stock (≈span)
+            axis, leaving the span direction unchanged.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.Geometry">
+            <summary>Station-based planform; sampled per strip for chord, thickness ratio,
+            section Cl_max, and form factor (taper), and integrated for wet planform / volume / area.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac0">
+            <summary>Span fraction (0 = root, 1 = tip) of the wet segment's start
+            (root-most wet point) on the full planform.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.WetSpanFrac1">
+            <summary>Span fraction of the wet segment's end (tip-most wet point).</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.CopAftOfStock_m">
+            <summary>Static chord-wise CoP offset from the strip span centroid,
+            measured along <see cref="P:Sim.Models.Util.FoilSolverInputs.ChordDirection_W"/>. 0 for a fixed foil where the
+            "stock" concept doesn't apply (forces act on the span centerline); ≈quarter-chord for an
+            unbalanced transom-hung rudder where the stock is at the leading edge. Dynamic α-driven
+            migration is added on top of this baseline inside the solver.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.StockAxis_W">
+            <summary>Optional unit axis (world frame) about which to integrate stock
+            torque. <c>null</c> if the component doesn't care about stock torque.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.StockPoint_W">
+            <summary>Optional point on the stock axis (world frame). Must be set
+            whenever <see cref="P:Sim.Models.Util.FoilSolverInputs.StockAxis_W"/> is set.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.Polar">
+            <summary>Polar parameters (span efficiency, broadside form drag).</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.Body">
+            <summary>Boat rigid-body state, for computing local inflow at each strip via
+            <c>v_strip = waves.OrbitalVelocity(strip) − (v_cg + ω × (strip − cg))</c>.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.Waves">
+            <summary>Wave field for orbital-velocity sampling.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.Time">
+            <summary>Simulation time.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.StripCount">
+            <summary>Number of strips along the wet segment. ≥1.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.WaterDensity">
+            <summary>kg/m³.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.FoilSolverInputs.KinematicViscosity">
+            <summary>m²/s.</summary>
+        </member>
+        <member name="T:Sim.Models.Util.FoilSolverResult">
+            <summary>What the solver produces. Strip forces are returned, not applied — the caller
+            hands them to its own aggregator (so the caller can attribute, log, or modify if needed).</summary>
+        </member>
+        <member name="M:Sim.Models.Util.FoilSolverResult.#ctor(System.Collections.Generic.IReadOnlyList{System.ValueTuple{System.Numerics.Vector3,System.Numerics.Vector3}},System.Collections.Generic.IReadOnlyList{Sim.Core.Appendage.FoilStripState},System.Numerics.Vector3,System.Single,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Boolean)">
+            <summary>What the solver produces. Strip forces are returned, not applied — the caller
+            hands them to its own aggregator (so the caller can attribute, log, or modify if needed).</summary>
+        </member>
+        <member name="T:Sim.Models.Util.HydroStrip">
+            <summary>
+            Pure, stateless per-strip hydrodynamics for a lifting surface (§15.3). Given a <i>resolved</i>
+            inflow and the strip's own leading/trailing-edge points (plus span direction, width, section
+            thickness, and the whole-foil wet aspect ratio), it returns the strip's force, application point
+            (centre of pressure), and force components. It knows nothing of waves, rigid-body state, or how
+            the foil is placed — the caller (<see cref="T:Sim.Models.Util.FoilSolver"/>) resolves all of that and hands each
+            strip its local inflow and edge geometry. This is what makes the per-strip physics unit-testable
+            without standing up a boat, and turns the whole-foil check into a force summation over strips.
+            </summary>
+            <remarks>
+            The centre of pressure is read straight from the geometry:
+            <c>CoP = LE + (StaticCopFraction + migration(α)) · (TE − LE)</c>, so it honours taper/sweep and
+            migrates aft with angle of attack. <c>StaticCopFraction</c> is the static chord-wise baseline as
+            a fraction of the local chord (¼-chord aerodynamic centre for a normal foil); the caller supplies
+            it.
+            </remarks>
+        </member>
+        <member name="T:Sim.Models.Util.HydroStripInputs">
+            <summary>Everything <see cref="M:Sim.Models.Util.HydroStrip.Solve(Sim.Models.Util.HydroStripInputs@)"/> needs for one strip. The inflow and edge
+            points are already resolved into the world frame by the caller.</summary>
+            <param name="Inflow_W">Fluid velocity relative to the strip (waves − rigid-body), world frame.</param>
+            <param name="LeadingEdge_W">Strip leading-edge point (its span centroid on the luff line).</param>
+            <param name="TrailingEdge_W">Strip trailing-edge point; <c>chord = TE − LE</c>.</param>
+            <param name="SpanDir_W">Unit span direction, for the span-normal projection.</param>
+            <param name="SpanWidth_m">Strip width along the span (→ planform / wetted area).</param>
+            <param name="ThicknessRatio">Section t/c → section Cl_max and form factor.</param>
+            <param name="AspectRatio">Whole-foil WET aspect ratio (the finite-wing correction is non-local).</param>
+            <param name="StaticCopFraction">Static chord-wise CoP baseline as a fraction of local chord
+            (¼ = aerodynamic centre). Dynamic α-driven migration is added on top inside the solver.</param>
+            <param name="WaterDensity">kg/m³.</param>
+            <param name="KinematicViscosity">m²/s.</param>
+            <param name="Polar">Span efficiency + broadside form drag.</param>
+            <param name="Toggles">Per-effect ablation switches.</param>
+        </member>
+        <member name="M:Sim.Models.Util.HydroStripInputs.#ctor(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,Sim.Models.Util.FoilPolarParameters,Sim.Core.Dynamics.PhysicsToggles)">
+            <summary>Everything <see cref="M:Sim.Models.Util.HydroStrip.Solve(Sim.Models.Util.HydroStripInputs@)"/> needs for one strip. The inflow and edge
+            points are already resolved into the world frame by the caller.</summary>
+            <param name="Inflow_W">Fluid velocity relative to the strip (waves − rigid-body), world frame.</param>
+            <param name="LeadingEdge_W">Strip leading-edge point (its span centroid on the luff line).</param>
+            <param name="TrailingEdge_W">Strip trailing-edge point; <c>chord = TE − LE</c>.</param>
+            <param name="SpanDir_W">Unit span direction, for the span-normal projection.</param>
+            <param name="SpanWidth_m">Strip width along the span (→ planform / wetted area).</param>
+            <param name="ThicknessRatio">Section t/c → section Cl_max and form factor.</param>
+            <param name="AspectRatio">Whole-foil WET aspect ratio (the finite-wing correction is non-local).</param>
+            <param name="StaticCopFraction">Static chord-wise CoP baseline as a fraction of local chord
+            (¼ = aerodynamic centre). Dynamic α-driven migration is added on top inside the solver.</param>
+            <param name="WaterDensity">kg/m³.</param>
+            <param name="KinematicViscosity">m²/s.</param>
+            <param name="Polar">Span efficiency + broadside form drag.</param>
+            <param name="Toggles">Per-effect ablation switches.</param>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.Inflow_W">
+            <summary>Fluid velocity relative to the strip (waves − rigid-body), world frame.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.LeadingEdge_W">
+            <summary>Strip leading-edge point (its span centroid on the luff line).</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.TrailingEdge_W">
+            <summary>Strip trailing-edge point; <c>chord = TE − LE</c>.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.SpanDir_W">
+            <summary>Unit span direction, for the span-normal projection.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.SpanWidth_m">
+            <summary>Strip width along the span (→ planform / wetted area).</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.ThicknessRatio">
+            <summary>Section t/c → section Cl_max and form factor.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.AspectRatio">
+            <summary>Whole-foil WET aspect ratio (the finite-wing correction is non-local).</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.StaticCopFraction">
+            <summary>Static chord-wise CoP baseline as a fraction of local chord
+            (¼ = aerodynamic centre). Dynamic α-driven migration is added on top inside the solver.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.WaterDensity">
+            <summary>kg/m³.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.KinematicViscosity">
+            <summary>m²/s.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.Polar">
+            <summary>Span efficiency + broadside form drag.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.HydroStripInputs.Toggles">
+            <summary>Per-effect ablation switches.</summary>
+        </member>
+        <member name="T:Sim.Models.Util.HydroStripLoad">
+            <summary>What one strip produces. Force acts at <see cref="P:Sim.Models.Util.HydroStripLoad.CoP_W"/>; any moment is
+            <c>(CoP_W − ref) × Force_W</c> (the caller does the stock-torque bookkeeping).</summary>
+        </member>
+        <member name="M:Sim.Models.Util.HydroStripLoad.#ctor(System.Numerics.Vector3,System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Single,System.Boolean)">
+            <summary>What one strip produces. Force acts at <see cref="P:Sim.Models.Util.HydroStripLoad.CoP_W"/>; any moment is
+            <c>(CoP_W − ref) × Force_W</c> (the caller does the stock-torque bookkeeping).</summary>
+        </member>
+        <member name="T:Sim.Models.Util.LiftingSurfaceGeometry">
+            <summary>
+            Strip / panel kinematics for a lifting surface, in the chord-span-normal section plane.
+            Pure geometry — no density, no polar, no force magnitudes. Consumed by both
+            <see cref="T:Sim.Models.Util.FoilSolver"/> (water foils: keel, rudder) and the panel-discretised mainsail model
+            (air) so the heel / cant / twist projection is implemented in one place and stays
+            consistent.
+            </summary>
+            <remarks>
+            For a surface with span direction <c>s</c> and chord direction <c>c</c> in world frame,
+            only the inflow component perpendicular to <c>s</c> produces lift (infinite-yawed-wing
+            approximation). α is measured in the plane perpendicular to <c>s</c>, between the
+            chord's own in-plane projection and the projected inflow; the lift vector is unit-normal
+            to the projected inflow within that plane. Skin friction and any pressure-drag terms
+            that act on the real surface velocity stay outside this kernel — the caller handles
+            those with the full inflow.
+            </remarks>
+        </member>
+        <member name="M:Sim.Models.Util.LiftingSurfaceGeometry.Resolve(System.Numerics.Vector3,System.Numerics.Vector3,System.Numerics.Vector3)">
+            <summary>Decompose the local flow into the span-normal section plane and resolve α
+            and the unit lift direction.</summary>
+            <param name="inflow_W">Local relative flow at the strip / panel centroid, world frame.
+            For a foil: <c>waves.OrbitalVelocity − (v_CG + ω × r)</c>. For a sail panel:
+            apparent wind <c>v_wind − v_panel_centroid</c>.</param>
+            <param name="chord_W">Chord direction (leading-edge → trailing-edge), world frame.
+            Expected unit-length. Any along-span component is projected out so the section plane
+            remains well-defined when the chord isn't strictly perpendicular to span (e.g. a sail
+            whose boom is pitched).</param>
+            <param name="spanDir_W">Unit vector along the span, world frame.</param>
+        </member>
+        <member name="T:Sim.Models.Util.StripFlow">
+            <summary>Output of the kinematic kernel. Caller multiplies by ρ, area, Cl/Cd from its own
+            polar, etc.</summary>
+            <param name="InflowPerpDir_W">Unit inflow projected into the span-normal plane;
+            <c>Vector3.Zero</c> when projected speed is below threshold. Foil induced-drag direction.</param>
+            <param name="InflowPerpSpeed">|inflow projected into the span-normal plane|. Use this for the
+            lift / induced-drag q (½ρV²); skin friction uses the full inflow magnitude.</param>
+            <param name="SinAlpha"><c>|sin α|</c> in [0,1] (the chord-perpendicular component). Used
+            squared (sail Cd), so sign-independent.</param>
+            <param name="Alpha_rad">Acute folded angle <c>asin(SinAlpha)</c> ∈ [0, π/2]. Non-negative;
+            what the SAIL consumes for luff/stall thresholds. For a signed full-range angle (foil) use
+            <see cref="P:Sim.Models.Util.StripFlow.SignedAlpha_rad"/>.</param>
+            <param name="LiftDir_W">Chord-derived unit lift direction (tack baked in); pairs with a
+            non-negative Cl — what the SAIL consumes. <c>Vector3.Zero</c> when α=0 or degenerate.</param>
+            <param name="SignedAlpha_rad">Signed full-range angle of attack ∈ (−π, π], measured about the
+            span: 0 = streaming over the leading edge, ±π/2 = broadside, ±π = over the trailing edge. Its
+            sign follows the lateral side the flow arrives from. What the FOIL consumes.</param>
+            <param name="FlowNormalDir_W">Fixed +90° handedness lift basis (= span × inflowPerpDir); the
+            lift side is carried by the SIGN of Cl, not this vector. Pairs with signed Cl — what the FOIL
+            consumes. <c>Vector3.Zero</c> when inflow is degenerate.</param>
+        </member>
+        <member name="M:Sim.Models.Util.StripFlow.#ctor(System.Numerics.Vector3,System.Single,System.Single,System.Single,System.Numerics.Vector3,System.Single,System.Numerics.Vector3)">
+            <summary>Output of the kinematic kernel. Caller multiplies by ρ, area, Cl/Cd from its own
+            polar, etc.</summary>
+            <param name="InflowPerpDir_W">Unit inflow projected into the span-normal plane;
+            <c>Vector3.Zero</c> when projected speed is below threshold. Foil induced-drag direction.</param>
+            <param name="InflowPerpSpeed">|inflow projected into the span-normal plane|. Use this for the
+            lift / induced-drag q (½ρV²); skin friction uses the full inflow magnitude.</param>
+            <param name="SinAlpha"><c>|sin α|</c> in [0,1] (the chord-perpendicular component). Used
+            squared (sail Cd), so sign-independent.</param>
+            <param name="Alpha_rad">Acute folded angle <c>asin(SinAlpha)</c> ∈ [0, π/2]. Non-negative;
+            what the SAIL consumes for luff/stall thresholds. For a signed full-range angle (foil) use
+            <see cref="P:Sim.Models.Util.StripFlow.SignedAlpha_rad"/>.</param>
+            <param name="LiftDir_W">Chord-derived unit lift direction (tack baked in); pairs with a
+            non-negative Cl — what the SAIL consumes. <c>Vector3.Zero</c> when α=0 or degenerate.</param>
+            <param name="SignedAlpha_rad">Signed full-range angle of attack ∈ (−π, π], measured about the
+            span: 0 = streaming over the leading edge, ±π/2 = broadside, ±π = over the trailing edge. Its
+            sign follows the lateral side the flow arrives from. What the FOIL consumes.</param>
+            <param name="FlowNormalDir_W">Fixed +90° handedness lift basis (= span × inflowPerpDir); the
+            lift side is carried by the SIGN of Cl, not this vector. Pairs with signed Cl — what the FOIL
+            consumes. <c>Vector3.Zero</c> when inflow is degenerate.</param>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.InflowPerpDir_W">
+            <summary>Unit inflow projected into the span-normal plane;
+            <c>Vector3.Zero</c> when projected speed is below threshold. Foil induced-drag direction.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.InflowPerpSpeed">
+            <summary>|inflow projected into the span-normal plane|. Use this for the
+            lift / induced-drag q (½ρV²); skin friction uses the full inflow magnitude.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.SinAlpha">
+            <summary><c>|sin α|</c> in [0,1] (the chord-perpendicular component). Used
+            squared (sail Cd), so sign-independent.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.Alpha_rad">
+            <summary>Acute folded angle <c>asin(SinAlpha)</c> ∈ [0, π/2]. Non-negative;
+            what the SAIL consumes for luff/stall thresholds. For a signed full-range angle (foil) use
+            <see cref="P:Sim.Models.Util.StripFlow.SignedAlpha_rad"/>.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.LiftDir_W">
+            <summary>Chord-derived unit lift direction (tack baked in); pairs with a
+            non-negative Cl — what the SAIL consumes. <c>Vector3.Zero</c> when α=0 or degenerate.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.SignedAlpha_rad">
+            <summary>Signed full-range angle of attack ∈ (−π, π], measured about the
+            span: 0 = streaming over the leading edge, ±π/2 = broadside, ±π = over the trailing edge. Its
+            sign follows the lateral side the flow arrives from. What the FOIL consumes.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.FlowNormalDir_W">
+            <summary>Fixed +90° handedness lift basis (= span × inflowPerpDir); the
+            lift side is carried by the SIGN of Cl, not this vector. Pairs with signed Cl — what the FOIL
+            consumes. <c>Vector3.Zero</c> when inflow is degenerate.</summary>
+        </member>
+        <member name="P:Sim.Models.Util.StripFlow.HasLift">
+            <summary>True iff there's a well-defined lift direction. Keyed off <see cref="P:Sim.Models.Util.StripFlow.LiftDir_W"/>,
+            which is zero exactly when the inflow aligns with the chord <i>line</i> (α≈0 or α≈±π) — the
+            angles where Cl≈0 — and on the degenerate no-inflow path. This is the correct gate for BOTH
+            consumers: the sail (which reads <see cref="P:Sim.Models.Util.StripFlow.LiftDir_W"/>) and the foil (which reads
+            <see cref="P:Sim.Models.Util.StripFlow.FlowNormalDir_W"/>). Note <see cref="P:Sim.Models.Util.StripFlow.FlowNormalDir_W"/> is non-zero even at the
+            aligned angles, so it must not be used for this gate — <see cref="P:Sim.Models.Util.StripFlow.LiftDir_W"/> is what
+            distinguishes "lift possible" from "chord-aligned, no lift".</summary>
+        </member>
+        <member name="T:Sim.Models.Util.NacaSection">
+            <summary>
+            Thickness-driven aerodynamic correlations for a NACA 4-digit symmetric section: the single
+            home that turns a section thickness ratio <c>t/c</c> into the polar inputs the foil models
+            previously carried as hand-tuned free constants. Pairs with <see cref="T:Sim.Core.Geometry.NacaProfile"/> (the
+            pure thickness shape in Sim.Core) and feeds <see cref="T:Sim.Models.Util.FoilPolar"/> / <see cref="T:Sim.Models.Util.SkinFriction"/>.
+            </summary>
+            <remarks>
+            These are engineering correlations, not table lookups — chosen to match the published 2-D
+            trends (Abbott &amp; von Doenhoff) at sailing Reynolds numbers while staying smooth and
+            monotonic so the per-strip evaluation never sees a discontinuity as the section tapers.
+            </remarks>
+        </member>
+        <member name="F:Sim.Models.Util.NacaSection.AreaCoefficient">
+            <summary>Section area coefficient (re-exported from <see cref="T:Sim.Core.Geometry.NacaProfile"/> for callers
+            that already use this class): section area = <c>chord² · (t/c) · AreaCoefficient</c>.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.NacaSection.FormFactor(System.Single)">
+            <summary>
+            Pressure-drag form factor <c>k</c> in the <c>(1 + k)</c> multiplier on skin friction
+            (<see cref="M:Sim.Models.Util.SkinFriction.ParasiticForceMagnitude(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Boolean)"/>). Hoerner's streamlined-section
+            correlation: <c>k = 2·(t/c) + 60·(t/c)⁴</c>. At t/c = 0.09 this gives ≈ 0.184; at 0.12,
+            ≈ 0.252 — both inside the 0.10–0.25 band the models used to hardcode at 0.15.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.NacaSection.SectionClMax(System.Single)">
+            <summary>
+            Section (2-D) maximum lift coefficient vs. thickness ratio, which sets stall onset in
+            <see cref="T:Sim.Models.Util.FoilPolar"/> (<c>α_stall = Cl_max / a_3D(AR)</c>) and the post-stall amplitude.
+            Thin sections stall early and low; lift rises with thickness to a peak near ~15 % then rolls
+            off. Capped quadratic anchored at the foils' operating Reynolds (~3–6e5, NOT the 3–6e6 wind-
+            tunnel maxima, where Cl_max is ~15–20 % higher): NACA 0006 ≈ 0.85, 0009 ≈ 1.07, 0012 ≈ 1.20,
+            0015 ≈ 1.24 (peak), 0018 ≈ 1.20. Clamped to [0.6, 1.5]. (A daggerboard at Re≈5e5 makes
+            noticeably less peak lift than the same section in a high-Re tunnel; using the tunnel maxima
+            over-predicts post-stall side force.)
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Util.SailPolar">
+            <summary>
+            Soft-sail polar: the normal-force coefficient of a flexible cambered sail as a function of
+            the signed, full-range angle of attack. Unlike a thin-airfoil polar, the sail's force is a
+            leeward normal force perpendicular to the sail (the caller applies it along
+            <c>sign(signedAlpha)·chordNormal</c>); the lift/drag split is a diagnostic decomposition with
+            the lift component <c>= Cn·|cos α|</c>. See the sail-aero-rework spec §3.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.SailPolar.Evaluate(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>Normal-force coefficient <c>Cn</c> (≥0), tangential friction <c>Cf</c>, and the
+            diagnostic <see cref="T:Sim.Core.Rig.PanelMode"/>.</summary>
+            <param name="signedAlpha">Full-range angle of attack (rad), from <c>flow.SignedAlpha_rad</c>.</param>
+            <param name="clMax">Peak of the lift component (Cn·|cos α|).</param>
+            <param name="peakAoA">Angle (rad) at which the lift component peaks (~0.35 = 20°).</param>
+            <param name="cnBroadside">Normal-force coefficient at broadside (=downwind drag, ~1.33).</param>
+            <param name="cf">Tangential skin-friction coefficient (~0.08).</param>
+            <param name="luffBand">Graded-luff width (rad) at each edge (~0.105 = 6°).</param>
+            <param name="backingEfficiency">By-the-lee bump scale (0..1, ~0.6).</param>
+            <param name="camberScale">Scales the camber contribution (the bump). The strip model passes depth ÷ design-camber so deeper strips lift more; 1 = legacy behaviour.</param>
+        </member>
+        <member name="T:Sim.Models.Util.SkinFriction">
+            <summary>
+            Reynolds-aware skin-friction correlations used by §21 to unify the parasitic-drag
+            model across the hull strips and the appendage foils. ITTC '57 is the v1 default;
+            it's valid for turbulent flow at <c>Re ≳ 1e5</c>, which covers every sailing speed a
+            dinghy will see. Callers should clamp <c>Re</c> to the <c>1e5</c> laminar floor
+            before calling (the formula over-predicts in the laminar regime).
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.SkinFriction.IttC57(System.Single)">
+            <summary>
+            ITTC '57 friction line:
+            <c>Cf = 0.075 / (log10(Re) − 2)²</c>.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.SkinFriction.ParasiticForceMagnitude(System.Single,System.Single,System.Single,System.Single,System.Single,System.Single,System.Boolean)">
+            <summary>
+            Parasitic (skin-friction) drag magnitude for one wetted surface patch:
+            <c>Cf(Re)·(1 + formFactor)·½·ρ·V²·A</c>, with Re = V·L/ν clamped to the 1e5 turbulent floor.
+            Shared by every wet surface (hull lumped, foil strips) so the model — and the
+            <see cref="P:Sim.Core.Dynamics.PhysicsToggles.ParasiticDrag"/> switch — lives in one place.
+            Returns 0 when <paramref name="enabled"/> is false or there is no flow / area.
+            The caller owns the force direction and application point.
+            </summary>
+        </member>
+        <member name="T:Sim.Models.Util.WaveMakingDrag">
+            <summary>
+            Parametric wave-making (residuary) resistance, per design-doc §15.2 and the
+            2026-06-08 hull-wave-drag spec. Wave-making drag is a non-local, Froude-driven
+            effect (energy radiated into surface gravity waves) with no cheap per-face form,
+            so it is modelled as a scalar Cw(Fr) curve applied along the hull's forward axis.
+            All knobs are feel-tuned in the live sim; this helper owns only the math.
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.WaveMakingDrag.Froude(System.Single,System.Single)">
+            <summary>Longitudinal Froude number Fr = |speed| / sqrt(g·L_wl). 0 if L_wl ≤ 0.</summary>
+        </member>
+        <member name="M:Sim.Models.Util.WaveMakingDrag.Cw(System.Single,System.Single,System.Single,System.Single,System.Single)">
+            <summary>
+            Asymmetric-Gaussian residuary-resistance coefficient: near-zero at low Fr, peaking at
+            <paramref name="frPeak"/> (≈ hull speed), then decaying as the boat climbs onto plane.
+            Separate rise/fall widths (<paramref name="sigmaLo"/>/<paramref name="sigmaHi"/>) shape the
+            "wall" and how cleanly the boat lets go onto plane. The low-Fr tail of the Gaussian keeps
+            Cw ≈ 0 below ~0.2 for the default widths (no hard cutoff → no discontinuity).
+            </summary>
+        </member>
+        <member name="M:Sim.Models.Util.WaveMakingDrag.ForceMagnitude(System.Single,System.Single,System.Single,System.Single)">
+            <summary>
+            Signed wave-drag force magnitude ½·ρ·S_ref·Cw·u·|u| (u = signed forward speed).
+            The caller applies it as <c>−magnitude · forwardAxis</c> so it always opposes forward motion
+            (and pushes forward when reversing). <paramref name="refArea"/> is a constant reference area,
+            not the instantaneous wetted area — wave-making is a whole-hull effect.
+            </summary>
+        </member>
+    </members>
+</doc>

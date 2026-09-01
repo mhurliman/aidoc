@@ -29,7 +29,7 @@ cbuffer MaterialConstants : register(b1) {
     float metallic;
     int hasTexture;
     int hasEmissiveTexture;
-    float _matPad;
+    int twoSided;
 };
 
 // Per-object world transform (b2). Defaults to identity for statically-placed meshes;
@@ -95,6 +95,18 @@ float Attenuation(Light light, float dist) {
 float4 PSMain(PSInput input) : SV_TARGET {
     float3 N = normalize(input.worldNorm);
     float3 V = normalize(cameraPos - input.worldPos);
+
+    // Two-sided lighting for thin geometry. A sail is a surface with no inside: which face you are
+    // looking at is a fact about the camera, not about the cloth, so the normal is turned to face the
+    // viewer. Without this a back face is lit by a normal pointing away and comes out black - and
+    // worse, the whole sail switches between lit and unlit the moment the boom crosses the
+    // centreline and the sim's published leeward direction legitimately changes sides.
+    //
+    // Gated on the material rather than applied to everything: on closed geometry a grazing-angle
+    // front face can have an interpolated normal that points slightly away, and flipping it there
+    // would put a dark rim around every silhouette.
+    if (twoSided && dot(N, V) < 0.0)
+        N = -N;
 
     // Base color
     float4 baseColor = baseColorFactor;

@@ -75,3 +75,10 @@ void GraphicsContext::DrawIndexedInstanced(UINT indexCount, UINT instanceCount, 
     m_commandList->DrawIndexedInstanced(indexCount, instanceCount, startIndex, baseVertex,
                                         startInstance);
 }
+
+void GraphicsContext::DrawInstanced(UINT vertexCount, UINT instanceCount, UINT startVertex,
+                                    UINT startInstance)
+{
+    FlushResourceBarriers();
+    m_commandList->DrawInstanced(vertexCount, instanceCount, startVertex, startInstance);
+}

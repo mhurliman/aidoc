@@ -126,6 +126,9 @@ void Material::Bind(
     constants.metallic = metallic;
     constants.hasTexture = HasBaseColorTexture() ? 1 : 0;
     constants.hasEmissiveTexture = HasEmissiveTexture() ? 1 : 0;
+    // A double-sided surface is one whose back faces are drawn, which is exactly when the shading
+    // has to cope with a normal pointing away from the viewer.
+    constants.twoSided = doubleSided ? 1 : 0;
 
     auto alloc = allocator.Allocate(sizeof(MaterialConstants));
     memcpy(alloc.cpuAddress, &constants, sizeof(MaterialConstants));

@@ -1,0 +1,192 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Sim.Telemetry</name>
+    </assembly>
+    <members>
+        <member name="T:Sim.Telemetry.AngleTrace">
+            <summary>
+            Turns a wrapped angular sample series (compass bearings, headings, signed wind angles) into a
+            continuous one by following the short way round the circle at each step — so the 0↔<c>period</c> seam
+            doesn't render as a full-height vertical jump and a plot can auto-centre on wherever the data sits.
+            Pure so the seam logic is unit-tested independent of Godot. <c>period</c> is one full turn in the
+            samples' own unit (2π for radians, 360 for degrees).
+            </summary>
+        </member>
+        <member name="M:Sim.Telemetry.AngleTrace.Unwrap(System.ReadOnlySpan{System.Single},System.Single)">
+            <summary>Unwrap <paramref name="raw"/> in place-order: each output tracks the previous by the
+            shortest angular step, so a 359°→2° pair becomes 359°→362° (a +3° move). Absolute level is
+            anchored to the first sample; callers that show axis labels should re-wrap for display.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.AngleTrace.WrapSym(System.Single,System.Single)">
+            <summary>Fold an angular delta into (−period/2, +period/2] so it takes the short way round.
+            A non-positive period passes the delta through unchanged (non-angular data).</summary>
+        </member>
+        <member name="T:Sim.Telemetry.AxisRange">
+            <summary>A plot's vertical axis bounds for a data window [<c>dataMin</c>, <c>dataMax</c>],
+            chosen so the zero line is meaningful:
+            <list type="bullet">
+            <item>All-non-negative data → baseline anchored at 0 (only the top is padded), so fluctuations
+            read in proportion to the absolute value — a 6800–7000 µs frame time shows as a near-flat line
+            high on the plot, not a full-height swing.</item>
+            <item>Signed data → symmetric about 0 (<c>Min == -Max</c>), so the zero line sits in the middle.</item>
+            </list>
+            Pure so the branch logic (non-negative / signed / degenerate) is unit-tested independent of Godot.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.AxisRange.#ctor(System.Double,System.Double)">
+            <summary>A plot's vertical axis bounds for a data window [<c>dataMin</c>, <c>dataMax</c>],
+            chosen so the zero line is meaningful:
+            <list type="bullet">
+            <item>All-non-negative data → baseline anchored at 0 (only the top is padded), so fluctuations
+            read in proportion to the absolute value — a 6800–7000 µs frame time shows as a near-flat line
+            high on the plot, not a full-height swing.</item>
+            <item>Signed data → symmetric about 0 (<c>Min == -Max</c>), so the zero line sits in the middle.</item>
+            </list>
+            Pure so the branch logic (non-negative / signed / degenerate) is unit-tested independent of Godot.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.ChannelStats">
+            <summary>Rolling per-channel statistics. Pure and deterministic — the unit that encodes the
+            real-time budget rule (overrun = sample strictly greater than budget). Updated by
+            <see cref="M:Sim.Telemetry.FrameCollector.Record(Sim.Telemetry.ProbeHandle,System.Double)"/>; reset re-seeds from the budget.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.ChannelStats.#ctor(System.Int64,System.Int64,System.Double,System.Double,System.Nullable{System.Double})">
+            <summary>Rolling per-channel statistics. Pure and deterministic — the unit that encodes the
+            real-time budget rule (overrun = sample strictly greater than budget). Updated by
+            <see cref="M:Sim.Telemetry.FrameCollector.Record(Sim.Telemetry.ProbeHandle,System.Double)"/>; reset re-seeds from the budget.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.ChannelStats.Empty(System.Nullable{System.Double})">
+            <summary>A fresh stat carrying the channel's budget and zeroed counters.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.ChannelStats.Record(System.Double)">
+            <summary>Fold one sample (microseconds) into the running stats.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.FleetPerfChannels">
+            <summary>
+            Per-frame CPU + render cost of the boats, so a host can see where a fleet spends its budget: the
+            chased (detailed) boat's physics + AI vs the rest of the fleet vs all boats, and the render cost of
+            the environment vs the chased boat vs every boat. All are per-frame sums (over the substeps).
+            <see cref="P:Sim.Telemetry.FleetPerfChannels.CpuAll"/> and <see cref="P:Sim.Telemetry.FleetPerfChannels.RenderAll"/> carry the frame budget so their utilisation reads
+            as a % of the frame — the numbers that tell you whether the fleet, not one boat, is the cost.
+            </summary>
+        </member>
+        <member name="M:Sim.Telemetry.FleetPerfChannels.#ctor(Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle)">
+            <summary>
+            Per-frame CPU + render cost of the boats, so a host can see where a fleet spends its budget: the
+            chased (detailed) boat's physics + AI vs the rest of the fleet vs all boats, and the render cost of
+            the environment vs the chased boat vs every boat. All are per-frame sums (over the substeps).
+            <see cref="P:Sim.Telemetry.FleetPerfChannels.CpuAll"/> and <see cref="P:Sim.Telemetry.FleetPerfChannels.RenderAll"/> carry the frame budget so their utilisation reads
+            as a % of the frame — the numbers that tell you whether the fleet, not one boat, is the cost.
+            </summary>
+        </member>
+        <member name="T:Sim.Telemetry.FrameCollector">
+            <summary>Allocation-free, multi-producer sink for one app. Producers <see cref="M:Sim.Telemetry.FrameCollector.Record(Sim.Telemetry.ProbeHandle,System.Double)"/> a
+            microsecond sample per channel (sim does this every substep; the host once per frame); a
+            consumer reads <see cref="M:Sim.Telemetry.FrameCollector.Latest(Sim.Telemetry.ProbeHandle)"/> (last writer, for display) and <see cref="M:Sim.Telemetry.FrameCollector.Stats(Sim.Telemetry.ProbeHandle)"/>
+            (accumulated over every sample, for overrun/max). Sized once from a finalized registry.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.FrameCollector.Record(Sim.Telemetry.ProbeHandle,System.Double)">
+            <summary>Record a microsecond sample for a channel (hot path: two array writes).</summary>
+        </member>
+        <member name="M:Sim.Telemetry.FrameCollector.SetBudget(Sim.Telemetry.ProbeHandle,System.Nullable{System.Double})">
+            <summary>Update a channel's budget at runtime, preserving its accumulated counts. Used when
+            the budget is dynamic — e.g. with vsync off, the render frame deadline becomes the achieved
+            frame time rather than a fixed refresh interval.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.FrameCollector.ResetStats">
+            <summary>Zero counts/max for every channel, preserving budgets. Leaves <see cref="M:Sim.Telemetry.FrameCollector.Latest(Sim.Telemetry.ProbeHandle)"/>
+            values untouched (display continuity).</summary>
+        </member>
+        <member name="M:Sim.Telemetry.FrameCollector.Measure(Sim.Telemetry.ProbeHandle)">
+            <summary><c>using var _ = collector.Measure(handle);</c> times the enclosing block and
+            records it. Allocation-free (ref struct).</summary>
+        </member>
+        <member name="T:Sim.Telemetry.ProbeHandle">
+            <summary>An opaque index into a <see cref="T:Sim.Telemetry.FrameCollector"/>'s channel arrays, handed out by
+            <see cref="M:Sim.Telemetry.TelemetryRegistry.Register(System.String,System.String,System.String,System.Nullable{System.Double})"/>. Keeps the hot path string-free.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.ProbeHandle.#ctor(System.Int32)">
+            <summary>An opaque index into a <see cref="T:Sim.Telemetry.FrameCollector"/>'s channel arrays, handed out by
+            <see cref="M:Sim.Telemetry.TelemetryRegistry.Register(System.String,System.String,System.String,System.Nullable{System.Double})"/>. Keeps the hot path string-free.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.ChannelDescriptor">
+            <summary>Static description of one telemetry channel: who produces it, its display name/unit,
+            and an optional per-sample budget in microseconds (null = no budget, display only).</summary>
+        </member>
+        <member name="M:Sim.Telemetry.ChannelDescriptor.#ctor(System.Int32,System.String,System.String,System.String,System.Nullable{System.Double})">
+            <summary>Static description of one telemetry channel: who produces it, its display name/unit,
+            and an optional per-sample budget in microseconds (null = no budget, display only).</summary>
+        </member>
+        <member name="T:Sim.Telemetry.RenderChannels">
+             <summary>Neutral handles for render-side channels. Names/units are engine-agnostic; the mapping
+             from a specific engine's counters to these handles lives in a host adapter (e.g. the Godot
+             <c>GodotPerformanceAdapter</c>).
+            
+             <para><see cref="P:Sim.Telemetry.RenderChannels.Frame"/> is the wall-clock frame *period* (under vsync it sits at the refresh
+             interval; budgeted so an overrun = a dropped frame). <see cref="P:Sim.Telemetry.RenderChannels.RenderCpu"/>/<see cref="P:Sim.Telemetry.RenderChannels.RenderGpu"/>
+             are the *actual* render work, independent of vsync — the honest headroom signal — and are
+             budgeted against the same per-frame deadline.</para></summary>
+        </member>
+        <member name="M:Sim.Telemetry.RenderChannels.#ctor(Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle)">
+             <summary>Neutral handles for render-side channels. Names/units are engine-agnostic; the mapping
+             from a specific engine's counters to these handles lives in a host adapter (e.g. the Godot
+             <c>GodotPerformanceAdapter</c>).
+            
+             <para><see cref="P:Sim.Telemetry.RenderChannels.Frame"/> is the wall-clock frame *period* (under vsync it sits at the refresh
+             interval; budgeted so an overrun = a dropped frame). <see cref="P:Sim.Telemetry.RenderChannels.RenderCpu"/>/<see cref="P:Sim.Telemetry.RenderChannels.RenderGpu"/>
+             are the *actual* render work, independent of vsync — the honest headroom signal — and are
+             budgeted against the same per-frame deadline.</para></summary>
+        </member>
+        <member name="T:Sim.Telemetry.SimChannels">
+            <summary>Handles for the four sim phases plus the per-tick total. Registered before the
+            collector exists (see <see cref="M:Sim.Telemetry.SimChannels.Register(Sim.Telemetry.TelemetryRegistry,System.Double)"/>); bundled with the collector into
+            <see cref="T:Sim.Telemetry.SimProbes"/> once it is built. Only <see cref="P:Sim.Telemetry.SimChannels.Total"/> carries the per-tick budget —
+            a phase overrun is meaningful only relative to the whole tick.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.SimChannels.#ctor(Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle,Sim.Telemetry.ProbeHandle)">
+            <summary>Handles for the four sim phases plus the per-tick total. Registered before the
+            collector exists (see <see cref="M:Sim.Telemetry.SimChannels.Register(Sim.Telemetry.TelemetryRegistry,System.Double)"/>); bundled with the collector into
+            <see cref="T:Sim.Telemetry.SimProbes"/> once it is built. Only <see cref="P:Sim.Telemetry.SimChannels.Total"/> carries the per-tick budget —
+            a phase overrun is meaningful only relative to the whole tick.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.SimProbes">
+            <summary>The collector plus the sim channel handles, handed to <c>SimSession</c> so
+            <c>Step</c> can record each phase. Optional: a null <c>SimProbes?</c> disables recording.</summary>
+        </member>
+        <member name="M:Sim.Telemetry.SimProbes.#ctor(Sim.Telemetry.FrameCollector,Sim.Telemetry.SimChannels)">
+            <summary>The collector plus the sim channel handles, handed to <c>SimSession</c> so
+            <c>Step</c> can record each phase. Optional: a null <c>SimProbes?</c> disables recording.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.TelemetryRegistry">
+            <summary>Discoverable list of telemetry channels, built once at startup. Producers call
+            <see cref="M:Sim.Telemetry.TelemetryRegistry.Register(System.String,System.String,System.String,System.Nullable{System.Double})"/> and keep the returned <see cref="T:Sim.Telemetry.ProbeHandle"/>; a
+            <see cref="T:Sim.Telemetry.FrameCollector"/> is then sized from <see cref="P:Sim.Telemetry.TelemetryRegistry.Count"/>. String keys live here, at
+            init only — never on the per-tick hot path.</summary>
+        </member>
+        <member name="T:Sim.Telemetry.TickTiming">
+            <summary>Per-tick wall-clock breakdown of <c>SimSession.Step</c>, in microseconds. Convenience
+            aggregate exposed as <c>SimSession.LastTickTiming</c>; always filled even when no collector is
+            wired. <see cref="P:Sim.Telemetry.TickTiming.OtherMicros"/> is the unattributed remainder (buffer copies, snapshot
+            construction).</summary>
+        </member>
+        <member name="M:Sim.Telemetry.TickTiming.#ctor(System.Double,System.Double,System.Double,System.Double,System.Double,System.Double,System.Double,System.Double,System.Double)">
+            <summary>Per-tick wall-clock breakdown of <c>SimSession.Step</c>, in microseconds. Convenience
+            aggregate exposed as <c>SimSession.LastTickTiming</c>; always filled even when no collector is
+            wired. <see cref="P:Sim.Telemetry.TickTiming.OtherMicros"/> is the unattributed remainder (buffer copies, snapshot
+            construction).</summary>
+        </member>
+        <member name="T:Sim.Telemetry.TimestampClock">
+            <summary>Low-overhead, allocation-free monotonic timing. Wraps
+            <see cref="M:System.Diagnostics.Stopwatch.GetTimestamp"/> and converts raw tick deltas to microseconds via a cached
+            reciprocal of <see cref="F:System.Diagnostics.Stopwatch.Frequency"/>.</summary>
+        </member>
+        <member name="F:Sim.Telemetry.TimestampClock.MicrosPerTick">
+            <summary>Microseconds per <see cref="T:System.Diagnostics.Stopwatch"/> tick (frequency is fixed for the process).</summary>
+        </member>
+        <member name="P:Sim.Telemetry.TimestampClock.Now">
+            <summary>Current raw timestamp (no allocation).</summary>
+        </member>
+        <member name="M:Sim.Telemetry.TimestampClock.Micros(System.Int64,System.Int64)">
+            <summary>Elapsed microseconds between two <see cref="P:Sim.Telemetry.TimestampClock.Now"/> timestamps.</summary>
+        </member>
+    </members>
+</doc>

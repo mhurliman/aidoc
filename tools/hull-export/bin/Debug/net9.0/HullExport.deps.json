@@ -1,0 +1,72 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v9.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v9.0": {
+      "HullExport/1.0.0": {
+        "dependencies": {
+          "Sim.Core": "1.0.0",
+          "Sim.Models": "1.0.0"
+        },
+        "runtime": {
+          "HullExport.dll": {}
+        }
+      },
+      "Sim.Core/1.0.0": {
+        "dependencies": {
+          "Sim.Telemetry": "1.0.0"
+        },
+        "runtime": {
+          "Sim.Core.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      },
+      "Sim.Models/1.0.0": {
+        "dependencies": {
+          "Sim.Core": "1.0.0"
+        },
+        "runtime": {
+          "Sim.Models.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      },
+      "Sim.Telemetry/1.0.0": {
+        "runtime": {
+          "Sim.Telemetry.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "HullExport/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Sim.Core/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Sim.Models/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Sim.Telemetry/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

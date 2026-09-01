@@ -36,6 +36,19 @@ public:
         float smallWaveCutoff = 0.01f;
         float directionality  = 1.0f;   // exponent on (k̂·ŵ)²; higher = waves align tighter to wind
         float choppiness      = 0.5f;   // λ: horizontal displacement scale [0,1]
+
+        // Debug: clamp the rendered spectrum to |n| <= modeLimit per axis, 0 for the full band.
+        // Set it to the buoyancy sum's mode count and the GPU draws the same truncated surface the
+        // physics samples, which is the only way to tell truncation apart from a real disagreement.
+        // It changes what is DRAWN, so it is a diagnostic, not a quality knob.
+        int modeLimit         = 0;
+
+        // Energy left in waves running AGAINST the wind. The Phillips directional term is squared
+        // and so cannot distinguish upwind from downwind: at 1 the ocean runs backwards as readily
+        // as forwards. Lower it and the sea starts to travel with the breeze. Energy, not amplitude
+        // - the height falls as the square root, so 0.07 (Tessendorf's value) is about a quarter.
+        // Defaults to 1 so enabling it is a deliberate act rather than a silent change of sea.
+        float upwindAttenuation = 1.0f;
         float timeScale       = 0.5f;   // slows or speeds up wave animation
         float maxTessellation = 32.0f;  // peak tessellation factor near camera
         float tessDistance    = 200.0f; // distance (m) at which tessellation reaches 1
@@ -100,6 +113,21 @@ public:
 
     // time: elapsed seconds since app start, used to animate the spectrum.
     void Update(CommandContext& ctx, LinearAllocator& alloc, float time);
+
+    // ---- GPU height readback (diagnostic) ------------------------------------------------------
+    // Copies the cascade height maps back to system memory so the CPU can read the exact texels the
+    // surface was displaced by. Everything else that claims to know the GPU surface re-derives it,
+    // and a re-derivation cannot measure the thing it is a copy of.
+    //
+    // Off by default: it moves ~1.5 MB a frame and is only wanted while a disagreement is being
+    // chased. The buffers are allocated on first enable, not at startup.
+    void EnableHeightReadback(bool enabled) { m_readbackEnabled = enabled; }
+    bool HeightReadbackEnabled() const { return m_readbackEnabled; }
+
+    // Height at a world XZ, summed across cascades from the read-back texels with the same
+    // bilinear filter and per-cascade scaling the domain shader applies. False until the first
+    // capture has made it back, which takes a few frames.
+    bool SampleHeightGPU(float worldX, float worldZ, float& outHeight) const;
 
     // CPU-side height evaluation using only the lowest `modes` frequency bins per axis.
     // Matches the GPU simulation exactly for those modes (same noise, same dispersion).
@@ -196,12 +224,13 @@ private:
 
     struct PhillipsParams
     {
-        float windTheta, windSpeed, smallWaveCutoff, amplitude, directionality;
+        float windTheta, windSpeed, smallWaveCutoff, amplitude, directionality, upwindAttenuation;
         bool operator==(const PhillipsParams& o) const
         {
             return windTheta == o.windTheta && windSpeed == o.windSpeed
                 && smallWaveCutoff == o.smallWaveCutoff && amplitude == o.amplitude
-                && directionality == o.directionality;
+                && directionality == o.directionality
+                && upwindAttenuation == o.upwindAttenuation;
         }
     };
 
@@ -260,6 +289,18 @@ private:
     ComPtr<ID3D12RootSignature> m_downsampleRootSig;
 
     // Compute PSOs (FFT pipeline)
+    // Readback ring. One slot per in-flight frame so a capture is never mapped while the GPU is
+    // still writing it; the CPU reads the slot whose frame has already retired.
+    static constexpr int kReadbackSlots = 3;
+    ComPtr<ID3D12Resource> m_heightReadback[kReadbackSlots];
+    std::vector<float>     m_readbackHeights;   // [cascade][row][col], .x channel only
+    UINT64 m_readbackRowPitch = 0;
+    int    m_readbackSlot     = 0;
+    int    m_readbackWarmup   = 0;
+    bool   m_readbackEnabled  = false;
+    bool   m_readbackValid    = false;
+
+    void CaptureHeightReadback(CommandContext& ctx);
     ComPtr<ID3D12PipelineState> PhillipsSpectrumPSO;
     ComPtr<ID3D12PipelineState> DynamicSpectrumPSO;
     ComPtr<ID3D12PipelineState> PrecomputePSO;

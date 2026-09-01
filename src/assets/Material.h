@@ -38,7 +38,9 @@ public:
         float metallic;
         int hasTexture;
         int hasEmissiveTexture;
-        float _pad;
+        // Two-sided lighting for thin geometry - cloth, blades, lines. Uses the padding slot that
+        // was already there, so the buffer layout is unchanged.
+        int twoSided;
     };
 
     // Shared pipeline state that all materials reference.

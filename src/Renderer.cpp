@@ -68,7 +68,16 @@ void Renderer::Init(ID3D12Device* device, ID3D12CommandQueue* queue, UINT frameC
 
     m_resourceManager.Init(device, queue);
     m_transientHeap.Init(device, 1024, 1);
-    m_linearAllocator.Init(device, 256 * 1024, frameCount);
+    // Per-frame upload arena. Everything dynamic lands here: frame and light constants, an object
+    // constant per entity per pass, and the CPU-built meshes - the boat rig and the wave-debug
+    // overlay - uploaded whole every frame.
+    //
+    // 256 KB was the old size and it overflowed by ONE 256-byte allocation once the rig grew from a
+    // handful of flat sail quads into a 48x28 patch plus spars, lines, foils and telltales: measured
+    // peak 262,400 bytes with the debug overlay on. Doubled rather than nudged, because the previous
+    // value had no headroom left and the failure mode is a hard stop mid-frame. The arena costs
+    // perFrameSize x frameCount of upload heap, so this is 1.5 MB.
+    m_linearAllocator.Init(device, 512 * 1024, frameCount);
 
     // Create null SRV for materials without textures
     UINT nullSrvIndex;

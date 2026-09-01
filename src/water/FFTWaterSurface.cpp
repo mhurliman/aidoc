@@ -250,6 +250,7 @@ void FFTWaterSurface::CreatePSOs()
     rasterDesc.FillMode = D3D12_FILL_MODE_WIREFRAME;
     gpsDesc.RasterizerState = rasterDesc;
     ASSERT_SUCCEEDED(m_device->CreateGraphicsPipelineState(&gpsDesc, IID_PPV_ARGS(&WaterFlatWireframePSO)));
+
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +789,11 @@ void FFTWaterSurface::BuildSpectrumPlot()
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
+        float dir  = powf(kw * kw, tweaks.directionality);
+        // Mirrors PhillipsSpectrum.hlsl, including the inverted sense: damping kw > 0 is what damps
+        // the waves that TRAVEL upwind, because of the transform sign. See the note there.
+        if (kw > 0.0f) dir *= tweaks.upwindAttenuation;
+        return tweaks.amplitude * expf(-1.0f / kL2) * dir * cutoff / (k2 * k2);
     };
 
     const int binCount = halfN + 1;
@@ -845,7 +850,11 @@ float FFTWaterSurface::SampleHeightCPU(float worldX, float worldZ, float elapsed
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
+        float dir  = powf(kw * kw, tweaks.directionality);
+        // Mirrors PhillipsSpectrum.hlsl, including the inverted sense: damping kw > 0 is what damps
+        // the waves that TRAVEL upwind, because of the transform sign. See the note there.
+        if (kw > 0.0f) dir *= tweaks.upwindAttenuation;
+        return tweaks.amplitude * expf(-1.0f / kL2) * dir * cutoff / (k2 * k2);
     };
 
     // Sum the low-frequency contribution of every cascade (matches the GPU render sum).
@@ -929,7 +938,11 @@ void FFTWaterSurface::SampleHeightGrid(float originX, float originZ, float cell,
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
+        float dir  = powf(kw * kw, tweaks.directionality);
+        // Mirrors PhillipsSpectrum.hlsl, including the inverted sense: damping kw > 0 is what damps
+        // the waves that TRAVEL upwind, because of the transform sign. See the note there.
+        if (kw > 0.0f) dir *= tweaks.upwindAttenuation;
+        return tweaks.amplitude * expf(-1.0f / kL2) * dir * cutoff / (k2 * k2);
     };
 
     const int GG = G * G;
@@ -1022,7 +1035,11 @@ void FFTWaterSurface::SampleSurfaceGrid(float originX, float originZ, float cell
         float kL2  = k2 * L * L;
         float kw   = (kx / kLen) * windCosT + (kz / kLen) * windSinT;
         float cutoff = expf(-k2 * tweaks.smallWaveCutoff * tweaks.smallWaveCutoff);
-        return tweaks.amplitude * expf(-1.0f / kL2) * powf(kw * kw, tweaks.directionality) * cutoff / (k2 * k2);
+        float dir  = powf(kw * kw, tweaks.directionality);
+        // Mirrors PhillipsSpectrum.hlsl, including the inverted sense: damping kw > 0 is what damps
+        // the waves that TRAVEL upwind, because of the transform sign. See the note there.
+        if (kw > 0.0f) dir *= tweaks.upwindAttenuation;
+        return tweaks.amplitude * expf(-1.0f / kL2) * dir * cutoff / (k2 * k2);
     };
 
     const int GG = G * G;
@@ -1253,7 +1270,143 @@ void FFTWaterSurface::Update(CommandContext& ctx, LinearAllocator& alloc, float 
     for (int c = 0; c < kNumCascades; ++c)
         RunCascadeFFT(ctx, alloc, m_cascades[c], simTime);
 
+    if (m_readbackEnabled) CaptureHeightReadback(ctx);
+
     ctx.FlushResourceBarriers();
+}
+
+// Copy this frame's height maps into the readback ring, and lift the slot that has retired into
+// m_readbackHeights. Called at the end of Update, where the maps have just been written and have
+// not yet been transitioned for rendering.
+void FFTWaterSurface::CaptureHeightReadback(CommandContext& ctx)
+{
+    const int N = m_desc.N, M = m_desc.M;
+
+    D3D12_RESOURCE_DESC texDesc = m_cascades[0].heightMap.GetResource()->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT64 rowBytes = 0, totalBytes = 0;
+    UINT   numRows  = 0;
+    m_device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowBytes,
+                                    &totalBytes);
+    m_readbackRowPitch = footprint.Footprint.RowPitch;
+
+    // Allocated on first use rather than at startup: this is a diagnostic and most runs never ask.
+    if (!m_heightReadback[0])
+    {
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+        D3D12_RESOURCE_DESC bufDesc = {};
+        bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width            = totalBytes * kNumCascades;
+        bufDesc.Height           = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels        = 1;
+        bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        for (int i = 0; i < kReadbackSlots; ++i)
+        {
+            ASSERT_SUCCEEDED(m_device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&m_heightReadback[i])));
+        }
+        m_readbackHeights.assign(static_cast<size_t>(N) * M * kNumCascades, 0.0f);
+        m_readbackWarmup = 0;
+        m_readbackValid  = false;
+    }
+
+    for (int c = 0; c < kNumCascades; ++c)
+        ctx.TransitionResource(m_cascades[c].heightMap, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ctx.FlushResourceBarriers();
+
+    auto* cmd = ctx.GetCommandList();
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource        = m_cascades[c].heightMap.GetResource();
+        src.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource       = m_heightReadback[m_readbackSlot].Get();
+        dst.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+        dst.PlacedFootprint.Offset = totalBytes * c;
+
+        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    for (int c = 0; c < kNumCascades; ++c)
+        ctx.TransitionResource(m_cascades[c].heightMap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // Read the slot the ring is about to reuse NEXT: it is the oldest, so the GPU has long since
+    // finished with it. Reading the slot just written would be a race; waiting for it would be a
+    // stall. The cost is that the number on screen is a few frames old, which for a surface that
+    // moves at wave frequencies is invisible.
+    m_readbackSlot = (m_readbackSlot + 1) % kReadbackSlots;
+    if (m_readbackWarmup < kReadbackSlots) { ++m_readbackWarmup; return; }
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = { 0, static_cast<SIZE_T>(totalBytes * kNumCascades) };
+    if (FAILED(m_heightReadback[m_readbackSlot]->Map(0, &readRange, &mapped))) return;
+
+    // R32G32; the surface reads .x, so only that channel is kept.
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        const auto* base = static_cast<const uint8_t*>(mapped) + totalBytes * c;
+        for (int y = 0; y < M; ++y)
+        {
+            const auto* row = reinterpret_cast<const float*>(base + m_readbackRowPitch * y);
+            float* out = &m_readbackHeights[(static_cast<size_t>(c) * M + y) * N];
+            for (int x = 0; x < N; ++x) out[x] = row[x * 2];
+        }
+    }
+
+    D3D12_RANGE noWrite = { 0, 0 };
+    m_heightReadback[m_readbackSlot]->Unmap(0, &noWrite);
+    m_readbackValid = true;
+}
+
+bool FFTWaterSurface::SampleHeightGPU(float worldX, float worldZ, float& outHeight) const
+{
+    if (!m_readbackValid) return false;
+
+    const int N = m_desc.N, M = m_desc.M;
+    float total = 0.0f;
+
+    for (int c = 0; c < kNumCascades; ++c)
+    {
+        if (!tweaks.cascadeEnabled[c]) continue;
+        const float rcp = 1.0f / m_cascades[c].tileSize;
+
+        // Same uv and the same bilinear filter the domain shader gets from its linear sampler,
+        // with WRAP addressing - reproducing the FETCH rather than the maths, which is the point.
+        const float u = worldX * rcp * static_cast<float>(N) - 0.5f;
+        const float v = worldZ * rcp * static_cast<float>(M) - 0.5f;
+        const int   x0 = static_cast<int>(std::floor(u)), y0 = static_cast<int>(std::floor(v));
+        const float fx = u - static_cast<float>(x0), fy = v - static_cast<float>(y0);
+
+        auto wrap = [](int i, int n) { return ((i % n) + n) % n; };
+        const int xa = wrap(x0, N), xb = wrap(x0 + 1, N);
+        const int ya = wrap(y0, M), yb = wrap(y0 + 1, M);
+
+        const float* plane = &m_readbackHeights[static_cast<size_t>(c) * M * N];
+        const float h00 = plane[static_cast<size_t>(ya) * N + xa];
+        const float h10 = plane[static_cast<size_t>(ya) * N + xb];
+        const float h01 = plane[static_cast<size_t>(yb) * N + xa];
+        const float h11 = plane[static_cast<size_t>(yb) * N + xb];
+
+        const float h = (h00 * (1.0f - fx) + h10 * fx) * (1.0f - fy)
+                      + (h01 * (1.0f - fx) + h11 * fx) * fy;
+
+        total += h * (rcp * 0.5f);   // the domain shader's amplitude scaling
+    }
+
+    outHeight = total;
+    return true;
 }
 
 // Phillips + DynamicSpectrum + IFFT + Permute for a single cascade. The ping-pong and
@@ -1272,20 +1425,24 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
     {
         PhillipsParams currentParams = { tweaks.windTheta, tweaks.windSpeed,
                                          tweaks.smallWaveCutoff, tweaks.amplitude,
-                                         tweaks.directionality };
+                                         tweaks.directionality, tweaks.upwindAttenuation };
         if (!cs.phillipsValid || !(currentParams == cs.lastPhillipsParams))
         {
             // h0 starts as UAV on first frame; on re-runs it's NPSR — transition back to UAV.
             ctx.TransitionResource(cs.h0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-            struct PhillipsGlobals { float windTheta, windSpeed, smallWaveCutoff, amplitude, dirExponent; };
+            struct PhillipsGlobals
+            {
+                float windTheta, windSpeed, smallWaveCutoff, amplitude, dirExponent;
+                float upwindAttenuation;
+            };
             auto fftAlloc  = alloc.Allocate(sizeof(FFTParameters));
             memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
 
             auto globAlloc = alloc.Allocate(sizeof(PhillipsGlobals));
             PhillipsGlobals globals = { tweaks.windTheta, tweaks.windSpeed,
                                         tweaks.smallWaveCutoff, tweaks.amplitude,
-                                        tweaks.directionality };
+                                        tweaks.directionality, tweaks.upwindAttenuation };
             memcpy(globAlloc.cpuAddress, &globals, sizeof(globals));
 
             cmd->SetComputeRootSignature(m_computeRootSig.Get());
@@ -1319,8 +1476,8 @@ void FFTWaterSurface::RunCascadeFFT(CommandContext& ctx, LinearAllocator& alloc,
         memcpy(fftAlloc.cpuAddress, &fftParams, sizeof(fftParams));
 
         auto timeAlloc = alloc.Allocate(256);
-        struct DynSpecGlobals { float SimulationTime; float Choppiness; };
-        DynSpecGlobals dynGlobals = { simTime, tweaks.choppiness };
+        struct DynSpecGlobals { float SimulationTime; float Choppiness; int ModeLimit; };
+        DynSpecGlobals dynGlobals = { simTime, tweaks.choppiness, tweaks.modeLimit };
         memcpy(timeAlloc.cpuAddress, &dynGlobals, sizeof(dynGlobals));
 
         cmd->SetComputeRootSignature(m_computeRootSig.Get());
